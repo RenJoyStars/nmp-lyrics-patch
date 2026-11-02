@@ -1,0 +1,5 @@
+#!/bin/sh
+# 安装前先退出正在运行的 NMP，否则替换后旧进程还占着文件
+pkill -x "Neural Mix Pro" >/dev/null 2>&1 || true
+sleep 1
+exit 0

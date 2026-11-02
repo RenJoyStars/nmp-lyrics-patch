@@ -1,0 +1,15 @@
+# 原版 App 备份（188MB，含商业软件二进制，不入库）
+/backup/
+
+# 编译产物与安装包（build/libNMPLyrics.dylib、dist/*.pkg）
+/build/
+/dist/
+
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# Xcode / clang 中间产物
+*.o
+*.dSYM

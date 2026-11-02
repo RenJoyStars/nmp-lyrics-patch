@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Neural Mix Pro 歌词版</title>
+    <readme file="readme.txt"/>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64,x86_64"/>
+    <allowed-os-versions>
+        <os-version min="11.0"/>
+    </allowed-os-versions>
+    <pkg-ref id="cn.renqiaoyi.nmplyrics"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="cn.renqiaoyi.nmplyrics"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="cn.renqiaoyi.nmplyrics" visible="false">
+        <pkg-ref id="cn.renqiaoyi.nmplyrics"/>
+    </choice>
+    <pkg-ref id="cn.renqiaoyi.nmplyrics" version="1.0" onConclusion="none">NeuralMixProLyrics.pkg</pkg-ref>
+</installer-gui-script>

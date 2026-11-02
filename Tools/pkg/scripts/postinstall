@@ -1,0 +1,9 @@
+#!/bin/sh
+# 装完后去掉下载隔离属性 —— 否则新机器上首次双击会被 Gatekeeper 拦（ad-hoc 签名）
+APP="/Applications/Neural Mix Pro.app"
+/usr/bin/xattr -cr "$APP" 2>/dev/null || true
+/usr/bin/xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+# 让 LaunchServices 重新登记（图标/双击行为）
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -f "$APP" >/dev/null 2>&1 || true
+exit 0

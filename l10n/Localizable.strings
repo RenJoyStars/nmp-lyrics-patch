@@ -1,0 +1,207 @@
+/*
+  Localizable.strings（zh-Hans）
+  NeuralMix 歌词补丁 · 全量汉化
+  译自 en.lproj/Localizable.strings（164 条，2020-03-26 by Rupert Daniel）
+  格式说明符（%@ %ld %lld）、\n、<a href> 链接原样保留。
+  注意：导出文件名默认值（-instrumental 等）保留英文——那是文件名不是界面文案。
+*/
+
+"Yes" = "是";
+"No" = "否";
+"Done" = "完成";
+"Cancel" = "取消";
+
+"Instrumental" = "伴奏";
+"Vocals" = "人声";
+"Acapella" = "纯人声";
+"Harmonic" = "和声";
+"Drums" = "鼓";
+"Bass" = "贝斯";
+"BassHarmonic" = "贝斯 + 和声";
+"BassHarmonicVocals" = "贝斯 + 和声 + 人声";
+"DrumsVocals" = "鼓 + 人声";
+"HarmonicVocals" = "和声 + 人声";
+"CustomEdit" = "原曲（自定义混音）";
+"HarmonicNoBass" = "和声（去贝斯）";
+
+// 导出
+"Export" = "导出";
+"ExportFormat" = "格式：";
+"ExportDestination" = "位置：";
+"ExportQuality" = "分离质量：";
+"CreateSubdirectory" = "将导出音轨归入子文件夹";
+"ExportOther" = "其他…";
+"ExportSuffix" = "后缀";
+"ExportPrefix" = "前缀";
+"ExportName" = "名称";
+"ExportInstrumentalDefaultFileName" = "-instrumental";
+"ExportVocalsDefaultFileName" = "-acappella";
+"ExportHarmonicDefaultFileName" = "-harmonic";
+"ExportBassDefaultFileName" = "-bass";
+"ExportBassHarmonicDefaultFileName" = "-bass-harmonic";
+"ExportBassHarmonicVocalsDefaultFileName" = "-bass-harmonic-vocals";
+"ExportDrumsDefaultFileName" = "-drums";
+"ExportDrumsVocalsDefaultFileName" = "-drums-vocals";
+"ExportPercussiveVocalsDefaultFileName" = "-drums-vocals";
+"ExportHarmonicVocalsDefaultFileName" = "-harmonic-vocals";
+"ExportNeuralMixDefaultFileName" = "-neural-mix";
+"ExportWaiting" = "等待中…";
+"ExportTrack" = "1 首音轨";
+"ExportTracks" = "%ld 首音轨";
+"ExportingTrack" = "正在导出 1 首音轨";
+"ExportingTracks" = "正在导出 %lld / %lld 首音轨";
+"ExportedFile" = "已导出 1 个文件";
+"ExportedFiles" = "已导出 %ld 个文件";
+"ExportTargetBPM" = "目标 BPM";
+"ExportTargetKey" = "目标调性";
+"ExportDuration" = "时长";
+"ExportLoopBeatInterval" = "循环节拍间隔";
+"QuantizeBPM" = "节拍量化";
+"QuantizeBPMBatch" = "对 BPM 波动的曲目做节拍量化";
+
+// 主菜单
+"turntable.playPause" = "播放 / 暂停";
+"turntable.autoRepeat" = "重复播放";
+"turntable.loadNextTrack" = "载入下一首";
+"turntable.loadPreviousTrack" = "载入上一首";
+"startPoint" = "打点";
+"turntable.gotoBeginning" = "回到开头";
+"turntable.startPoint" = "在当前位置打点";
+"turntable.clearStartPoint" = "清除打点";
+"looping" = "循环";
+"turntable.autoLoopOnOff" = "自动循环";
+"turntable.autoLoopDurationHalf" = "循环减半";
+"turntable.autoLoopDurationDouble" = "循环加倍";
+"turntable.loopIn" = "循环入点";
+"turntable.loopOut" = "循环出点";
+"turntable.loopingActiveAndReloopWhenOff" = "再次循环";
+"beatGrid" = "节拍网格";
+"turntable.downBeat" = "设定小节强拍";
+"turntable.bpmHalf" = "BPM 减半";
+"turntable.bpmDouble" = "BPM 加倍";
+"turntable.bpmAndDownBeatRestoreAnalyzed" = "恢复分析值";
+"turntable.resetAllEffects" = "重置所有控制";
+
+"restoreDownbeat" = "重置";
+
+"TrackSoloTitle" = "%@ 独奏";
+"TrackMuteTitle" = "静音 %@";
+"TrackVolumeTitle" = "%@ 音量";
+
+"appFeedback" = "向 <AppName> 反馈";
+
+// 关于
+"AboutWindowTitle" = "关于";
+"versionLabel" = "版本 %@";
+"AboutLegalDisclaimer" = "<a href=\"APPURLSCHEME://terms\">条款与条件</a>";
+
+// 偏好设置
+"Preferences" = "偏好设置…";
+"GeneralHeading" = "通用";
+"TempoRangeLabel" = "速度滑杆范围：±";
+"AutoPlayLong" = "载入歌曲后自动开始播放";
+"unmixerAutoResetOnSongLoadLabel" = "载入歌曲时重置 Neural Mix 控件";
+"SeparationQualityHeading" = "分离质量";
+"SeparationQualityPlayback" = "播放";
+"SeparationQualityExport" = "导出";
+"QuantizeManualLoops" = "循环按节拍量化";
+
+// NeuralMix 画质档位
+"NeuralMixVersion2MediumLabel" = "最高（100%）";
+"NeuralMixVersion2LightLabel" = "高（80%）";
+"NeuralMixVersion1Label" = "中（60%）";
+"NeuralMixVersionUpgradeHint-Mac" = "最高（100%）播放画质需要搭载 M1 或更新芯片的 Mac。";
+
+// 播放器
+"StartPointSet" = "设定打点";
+"StartPointClear" = "清除打点";
+"Start" = "打点";
+"LoopModeAuto" = "自动";
+"LoopModeManual" = "手动";
+"ManualLoopIn" = "入";
+"ManualLoopOut" = "出";
+"Pitch" = "音高";
+"Tempo" = "速度";
+"PlayerDropZonePlaceholder" = "把歌曲拖到这里";
+
+// 媒体库
+"MyMusic" = "我的音乐";
+"MyFiles" = "我的文件";
+
+// 购买引导
+"UpsellDismiss" = "以后再说";
+"UpsellPuchaseProduct" = "立即购买";
+"UpsellPuchaseProductWithPrice" = "立即购买 %@";
+"UpsellFeatureIsolate" = "实时分离节拍、乐器与人声。";
+"UpsellFeatureExport" = "离线导出：为任意歌曲制作伴奏与纯人声。";
+"UpsellFeatureLoops" = "提取任意乐器的节拍同步循环段。";
+"UpsellFeaturePlayer" = "进阶播放器：变速、变调、循环。";
+"UpsellFeatureBrowser" = "音乐浏览器：多轨导出、BPM 与调性检测。";
+
+// 许可协议
+"EULATitle" = "许可协议";
+"EULAConfirm" = "我已阅读并接受条款与条件。";
+"Decline" = "拒绝";
+"Accept" = "接受";
+
+// 欢迎
+"WelcomeTitle" = "音源分离";
+"WelcomeInfo" = "提取任意歌曲中的节拍、乐器与人声。";
+"WelcomeAction" = "开始使用";
+"WelcomeLegalDisclaimer" = "使用本软件即表示你同意<a href=\"APPURLSCHEME://terms\">条款与条件</a>，并尊重第三方版权。";
+
+// 标题栏
+"BuyNow" = "立即购买";
+
+// 许可管理
+"PurchaseErrorTitle" = "出了点问题";
+"PurchaseErrorMessage" = "购买无法激活，请尝试重启 App。";
+"PurchaseRestoreSuccessTitle" = "搞定！";
+"PurchaseRestoreSuccessMessageSubscription" = "你的订阅已恢复。";
+"PurchaseRestoreSuccessMessageNonSubscription" = "你的购买已恢复。";
+"PurchaseRestoreFailedTitle" = "未找到许可";
+"PurchaseRestoreFailedMessage" = "未在你的账户中找到许可。";
+"SubscriptionAlreadyActiveAlertTitle" = "搞定！";
+"SubscriptionAlreadyActiveAlertMessage" = "你已拥有许可。";
+
+// 歌曲载入
+"loadingTrackFailedTitle" = "无法载入音轨";
+"loadingTrackNotAvailableTitle" = "音轨不可用";
+"loadingTrackFailedAssetIsCloudItemMsg" = "该曲目还没有从 iCloud 下载到本地，无法播放。\n请在「音乐」App 里点曲目旁边的 iCloud 图标，先完成下载。";
+"loadingTrackFailedAssetNotAvailableMsg" = "该曲目受 DRM 保护或不可用，无法播放。";
+"loadingTrackFailedFileNotFoundMsg" = "曲目暂时无法播放。请先与 iTunes 同步（或等同步完成）后再试。";
+"loadingTrackFailedNotAvailable" = "曲目不可用，无法播放。";
+
+// 唱盘显示
+
+"startUpDisplayMessage" = "把歌曲拖到唱盘上";
+
+// 调号（无障碍朗读名）
+"Key-C" = "C 大调";
+"Key-Am" = "a 小调";
+"Key-Db" = "降 D 大调";
+"Key-Bbm" = "降 b 小调";
+"Key-D" = "D 大调";
+"Key-Bm" = "b 小调";
+"Key-Eb" = "降 E 大调";
+"Key-Cm" = "c 小调";
+"Key-E" = "E 大调";
+"Key-C#m" = "升 c 小调";
+"Key-F" = "F 大调";
+"Key-Dm" = "d 小调";
+"Key-Gb" = "降 G 大调";
+"Key-Ebm" = "降 e 小调";
+"Key-G" = "G 大调";
+"Key-Em" = "e 小调";
+"Key-Ab" = "降 A 大调";
+"Key-Fm" = "f 小调";
+"Key-A" = "A 大调";
+"Key-F#m" = "升 f 小调";
+"Key-Bb" = "降 B 大调";
+"Key-Gm" = "g 小调";
+"Key-B" = "B 大调";
+"Key-G#m" = "升 g 小调";
+
+// 节拍网格选项
+"StraightGridSettingDynamic" = "动态";
+"StraightGridSettingStraight" = "平直";
