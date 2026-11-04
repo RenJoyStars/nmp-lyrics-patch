@@ -1,11 +1,13 @@
 # Neural Mix Pro · 中文歌词补丁
 
-> 2026-10-27 起 | Algoriddim Neural Mix Pro 的私人补丁（本人本机使用）
+> Algoriddim Neural Mix Pro 的 macOS 增强补丁（注入式 dylib）
 > 做三件事：**界面汉化** ＋ **独立歌词窗（课堂投影用）** ＋ **标题栏一键呼出按钮**
 
-> ⚠️ **本仓库只放源码**。原版 App 备份（`backup/`，188MB）与打包好的安装包（`dist/`，136MB）
-> 都**不在仓库里**，需要自行准备一份已完成初始安装的 Neural Mix Pro。
-> 仓库为私有，仅供个人使用，不对外分发任何商业软件本体。
+> ⚠️ **本仓库只放源码**，不包含 Neural Mix Pro 本体，也不含打包好的安装包。
+> 使用前提：你自己的机器上已安装 Neural Mix Pro；补丁只修改本机上这个 App 的界面与行为。
+> `backup/`（原版备份，188MB）与 `dist/`（安装包，136MB）都在 `.gitignore` 里，不会出现在仓库中。
+>
+> 本项目与 Algoriddim 无关，未获其授权或认可；Neural Mix Pro 的著作权归 Algoriddim 所有。
 
 ## 快速开始
 
@@ -102,7 +104,7 @@ NMP-歌词补丁/
 ├── src/main.m              动态库源码（注入 NMP 进程）
 ├── l10n/Localizable.strings 中文文案（UTF-8，构建时转 UTF-16）
 ├── Tools/inject.py         Mach-O 注入器（两个 slice 各加一条 LC_LOAD_DYLIB）
-├── Tools/package.sh        打成可分发 pkg（内含整个 App）
+├── Tools/package.sh        打成 pkg（内含整个 App，勿公开分发）
 ├── build.sh                正式安装：编译 → 放进 /Applications → 注入 → 重签
 ├── build-staging.sh        staging 副本（不动 /Applications，用于验证）
 ├── restore.sh              还原：用 backup/ 里的原版覆盖回来
@@ -110,13 +112,16 @@ NMP-歌词补丁/
 └── dist/                   打好的 pkg（136MB）— 本地目录，已 gitignore
 ```
 
-## 打包给别人
+## 打包成 pkg（仅限自己的设备）
 
 ```sh
 zsh Tools/package.sh
 ```
 
-产出 `dist/Neural Mix Pro 歌词版 1.0.pkg`（约 136MB），里面是**整个 App**，对方不用另装原版。
+产出 `dist/Neural Mix Pro 歌词版 1.0.pkg`（约 136MB），里面是**整个 App**，装到另一台机器时不用另装原版。
+
+> ⚠️ 这个 pkg 里含 Neural Mix Pro 的完整程序本体，**不要公开分发、不要上传到网盘或仓库**。
+> 本仓库只放补丁源码，是有意为之。
 
 - payload：`ditto --noextattr --noqtn` 拷贝已打补丁的 App → 不带本机隔离属性
 - preinstall：先 `pkill` 退出正在运行的 NMP，避免替换时文件被占用
