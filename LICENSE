@@ -19,14 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Note on third-party software
-
-This license covers only the patch source code in this repository (the injected
-dynamic library, the Mach-O injector, the build scripts and the localization
-strings). It does NOT cover Neural Mix Pro, which is proprietary software
-copyright Algoriddim GmbH. This project is not affiliated with, authorized by,
-or endorsed by Algoriddim. No part of Neural Mix Pro is distributed here.
-You are responsible for obtaining your own licensed copy.

@@ -135,3 +135,18 @@ zsh Tools/package.sh
 ```sh
 zsh restore.sh
 ```
+
+## 许可与免责
+
+本仓库的**补丁源码**（注入库 `src/main.m`、注入器 `Tools/inject.py`、构建脚本、本地化文案）
+以 [MIT 协议](LICENSE) 开源，可自由使用与修改。
+
+- **不包含 Neural Mix Pro**：仓库里没有任何 Algoriddim 的程序本体、资源或密钥。
+- **需要自备授权**：请在你已合法获得 Neural Mix Pro 的机器上使用本补丁。
+- **与 Algoriddim 无关**：本项目非官方，未获 Algoriddim 授权或认可；「Neural Mix Pro」
+  及其商标、著作权归 Algoriddim 所有。
+- **自担风险**：补丁会修改 `/Applications` 里的 App 并重新签名，可能影响该 App 的
+  更新、公证与稳定性；`restore.sh` 可还原，但请自行做好备份。
+
+如果你只想用成品，`Tools/package.sh` 打出来的 pkg 里含**整个 App**，
+那是给你自己的设备用的，请不要公开分发。
