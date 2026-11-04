@@ -1,5 +1,10 @@
 # Neural Mix Pro · 中文歌词补丁
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/macOS-11%2B%20%C2%B7%20universal-green)
+![Type](https://img.shields.io/badge/type-dylib%20injection-orange)
+![No binary](https://img.shields.io/badge/binaries-none%20(source%20only)-lightgrey)
+
 > Algoriddim Neural Mix Pro 的 macOS 增强补丁（注入式 dylib）
 > 做三件事：**界面汉化** ＋ **独立歌词窗（课堂投影用）** ＋ **标题栏一键呼出按钮**
 
