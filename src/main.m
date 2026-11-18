@@ -24,6 +24,41 @@
 #import <mach-o/nlist.h>
 #import <objc/runtime.h>
 
+// ================================================================ 诊断日志
+// 同时写 NSLog 和 ~/Library/Logs/NMPLyrics.log。
+// 补丁在别人机器上不生效时，让对方把这个文件发回来，就能看出断在哪一步：
+// 是 dylib 没加载、还是没收到启动通知、还是标题栏没找到。
+// 日志只追加、不加密，内容只有启动流程，不含任何用户数据。
+
+static void NMPLog(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSLog(@"[NMPLyrics] %@", msg);
+    @try {
+        NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *path = [dir stringByAppendingPathComponent:@"NMPLyrics.log"];
+        NSString *line = [NSString stringWithFormat:@"%@  %@\n",
+                          [NSDateFormatter localizedStringFromDate:[NSDate date]
+                                                         dateStyle:NSDateFormatterShortStyle
+                                                         timeStyle:NSDateFormatterMediumStyle],
+                          msg];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) {
+            [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
+            fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        }
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } @catch (NSException *e) {
+        // 写不了文件不影响功能
+    }
+}
+
 // ================================================================ fishhook（精简版）
 // 源自 Meta 的 fishhook（BSD 3-Clause），只保留 rebind_symbols_image 能力。
 
@@ -179,9 +214,11 @@ static FILE *hooked_fopen(const char *path, const char *mode) {
 
 // ================================================================ 偏好键
 
-static NSString *const kPrefFolder   = @"cn.renqiaoyi.lyrics.folder";
-static NSString *const kPrefOnTop    = @"cn.renqiaoyi.lyrics.onTop";
-static NSString *const kPrefFontScale = @"cn.renqiaoyi.lyrics.fontScale";
+static NSString *const kPrefFolder     = @"cn.renqiaoyi.lyrics.folder";
+static NSString *const kPrefOnTop      = @"cn.renqiaoyi.lyrics.onTop";
+static NSString *const kPrefFontScale  = @"cn.renqiaoyi.lyrics.fontScale";
+static NSString *const kPrefFontWeight = @"cn.renqiaoyi.lyrics.fontWeight";
+static NSString *const kPrefAlignment  = @"cn.renqiaoyi.lyrics.alignment";
 static NSString *const kDefaultFolder =
     @"~/Library/Mobile Documents/com~apple~CloudDocs/音乐";
 
@@ -202,8 +239,16 @@ static NSString *const kDefaultFolder =
 
 @interface NMPLine : NSObject
 @property (nonatomic, assign) double time;
+/// 这一行的「实际演唱时长」——不含它后面的间奏。
+/// 旧代码直接拿「下一行的时间差」当扫光时长，只要中间有间奏，
+/// 这行就被摊成 10 秒慢慢扫，用户看到的就是「慢动作」。
+@property (nonatomic, assign) double duration;
 @property (nonatomic, copy)   NSString *text;
 @property (nonatomic, strong) NSArray<NMPWord *> *words;
+/// 歌词源里**真有**逐字时间戳（不是后面合成的）。
+/// 只有这种行，才知道「最后一个字什么时候唱完」，间奏才有可能判准；
+/// Apple Music / SimpMusic 也是只对逐字歌词画三个点，纯行级 LRC 一律不画。
+@property (nonatomic, assign) BOOL timed;
 @end
 @implementation NMPLine
 @end
@@ -258,24 +303,6 @@ static NSString *NormalizeTitle(NSString *s) {
 //     现在只给屏幕内的几行建，行高按 (行号, 距离档位) 缓存。
 //  4. 去掉了 NSShadow（纯黑底上根本看不出阴影，却最烧 GPU）。
 
-static inline CGFloat NMPClassScale(NSInteger cls) {
-    switch (cls) {
-        case 0:  return 1.00;
-        case 1:  return 0.56;
-        case 2:  return 0.48;
-        case 3:  return 0.43;
-        default: return 0.40;
-    }
-}
-static inline CGFloat NMPClassAlpha(NSInteger cls) {
-    switch (cls) {
-        case 0:  return 1.00;
-        case 1:  return 0.50;
-        case 2:  return 0.34;
-        case 3:  return 0.24;
-        default: return 0.16;
-    }
-}
 
 @interface NMPStageView : NSView
 @property (nonatomic, strong) NSArray<NMPLine *> *lines;
@@ -285,17 +312,95 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
 @property (nonatomic, assign) CGFloat activeProgress;
 @property (nonatomic, readonly) CGFloat fontSize;   // 窗口尺寸 × 用户倍率
 @property (nonatomic, assign) CGFloat fontScale;    // 滑条：0.6 – 2.0
+@property (nonatomic, assign) NSInteger fontWeightIndex; // 0:常规, 1:中黑, 2:粗体, 3:特粗
+@property (nonatomic, assign) NSInteger alignmentIndex;  // 0:居中, 1:靠左
 @property (nonatomic, assign) BOOL animating;       // 滚动还没停 → 需要继续出帧
+// 间奏：当前句唱完、下一句还早 —— 和 Apple Music 一样点三个点
+@property (nonatomic, assign) BOOL showDots;
+@property (nonatomic, assign) double dotPhase;      // 驱动点的相位（秒，来自播放位置）
+@property (nonatomic, assign) CGFloat dotFade;      // 0–1：点淡入进度，也用来把唱完那句压暗
+@property (nonatomic, assign) BOOL forceSettle;     // 调试用：下一帧直接跳到目标滚动位置
+@property (nonatomic, weak) NSView *hoverBar;       // 悬停时才淡入的控件组（字号滑条）
+@property (nonatomic, strong) NSColor *bgColor;      // 和 NMP 主窗一致的底色（由外部注入）
+@property (nonatomic, copy) void (^onSeekToSeconds)(double seconds); // 点击歌词跳转播放
 @end
 
 @implementation NMPStageView {
-    NSMutableDictionary<NSNumber *, NSNumber *> *_textH;   // (行号<<3 | 档位) -> 文字高度
+    NSMutableDictionary<NSNumber *, NSNumber *> *_textH;   // 行号 -> 文字基准高度
     CGFloat _cacheFS;
     CGFloat _cacheW;
     CGFloat _scrollY;
+    CGFloat _scrollVelocity;
+    NSArray<NSNumber *> *_lineTops;
+    NSArray<NSNumber *> *_lineHeights;
     NSGradient *_gTop;
     NSGradient *_gBot;
     CGFloat _gHeight;
+    NSInteger _activeIndex;
+    NSInteger _prevActiveIndex;
+    CGFloat _transitionProgress;
+    NSInteger _fontWeightIndex;
+    NSInteger _alignmentIndex;
+}
+
+@synthesize activeIndex = _activeIndex;
+
+- (void)setFontWeightIndex:(NSInteger)idx {
+    if (_fontWeightIndex == idx) return;
+    _fontWeightIndex = idx;
+    [_textH removeAllObjects];
+    [self setNeedsDisplay:YES];
+}
+
+- (void)setAlignmentIndex:(NSInteger)idx {
+    if (_alignmentIndex == idx) return;
+    _alignmentIndex = idx;
+    [_textH removeAllObjects];
+    [self setNeedsDisplay:YES];
+}
+
+- (NSFontWeight)activeWeight {
+    switch (self.fontWeightIndex) {
+        case 0:  return NSFontWeightMedium;
+        case 1:  return NSFontWeightSemibold;
+        case 2:  return NSFontWeightBold;
+        case 3:  return NSFontWeightHeavy;
+        default: return NSFontWeightBold;
+    }
+}
+
+- (NSFontWeight)inactiveWeightForDist:(NSInteger)dist {
+    switch (self.fontWeightIndex) {
+        case 0:  return (dist <= 1) ? NSFontWeightRegular : NSFontWeightLight;
+        case 1:  return (dist <= 1) ? NSFontWeightMedium  : NSFontWeightRegular;
+        case 2:  return (dist <= 1) ? NSFontWeightMedium  : NSFontWeightRegular;
+        case 3:  return (dist <= 1) ? NSFontWeightBold    : NSFontWeightMedium;
+        default: return (dist <= 1) ? NSFontWeightMedium  : NSFontWeightRegular;
+    }
+}
+
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        _prevActiveIndex = -1;
+        _transitionProgress = 1.0;
+        _textH = [NSMutableDictionary dictionary];
+    }
+    return self;
+}
+
+- (void)setActiveIndex:(NSInteger)newIdx {
+    if (_activeIndex == newIdx) return;
+    if (_lines.count > 0 && labs(newIdx - _activeIndex) == 1) {
+        _prevActiveIndex = _activeIndex;
+        _transitionProgress = 0.0;
+    } else {
+        _prevActiveIndex = -1;
+        _transitionProgress = 1.0;
+    }
+    _activeIndex = newIdx;
+    self.animating = YES;
+    [self setNeedsDisplay:YES];
 }
 
 - (BOOL)isFlipped { return YES; }
@@ -305,6 +410,12 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
     _lines = lines;
     [_textH removeAllObjects];
     _scrollY = 0;
+    _scrollVelocity = 0;
+    _lineTops = nil;
+    _lineHeights = nil;
+    _activeIndex = 0;
+    _prevActiveIndex = -1;
+    _transitionProgress = 1.0;
     [self setNeedsDisplay:YES];
 }
 
@@ -330,9 +441,70 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
     [self setNeedsDisplay:YES];
 }
 
+// ── 鼠标悬停才显示字号控件：平时屏幕上是纯净的歌词，不留任何 UI ──
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    for (NSTrackingArea *a in self.trackingAreas) [self removeTrackingArea:a];
+    NSTrackingArea *area = [[NSTrackingArea alloc]
+        initWithRect:self.bounds
+             options:(NSTrackingMouseEnteredAndExited | NSTrackingActiveInActiveApp |
+                      NSTrackingInVisibleRect)
+               owner:self userInfo:nil];
+    [self addTrackingArea:area];
+}
+
+- (void)mouseEntered:(NSEvent *)event { [self fadeHoverTo:1.0]; }
+- (void)mouseExited:(NSEvent *)event  { [self fadeHoverTo:0.0]; }
+
+- (void)fadeHoverTo:(CGFloat)alpha {
+    NSView *bar = self.hoverBar;
+    if (!bar) return;
+    if (fabs(bar.alphaValue - alpha) < 0.01) return;
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *c) {
+        c.duration = 0.18;
+        [[bar animator] setAlphaValue:alpha];
+    } completionHandler:nil];
+}
+
+// ── 点击歌词行跳转播放（Click to Seek · Apple Music 交互）──
+- (void)mouseDown:(NSEvent *)event {
+    NSPoint locInWin = event.locationInWindow;
+    NSPoint pt = [self convertPoint:locInWin fromView:nil];
+
+    // 若点击在悬停控制栏（字号滑块）内，交还默认处理
+    if (self.hoverBar && self.hoverBar.alphaValue > 0.05) {
+        NSPoint inBar = [self.hoverBar convertPoint:locInWin fromView:nil];
+        if (NSPointInRect(inBar, self.hoverBar.bounds)) {
+            [super mouseDown:event];
+            return;
+        }
+    }
+
+    if (!self.lines.count || !_lineTops.count) return;
+
+    CGFloat clickY = pt.y + _scrollY;
+    NSInteger hitIndex = -1;
+    for (NSInteger i = 0; i < (NSInteger)_lineTops.count; i++) {
+        CGFloat top = [_lineTops[i] doubleValue];
+        CGFloat h = (i < (NSInteger)_lineHeights.count) ? [_lineHeights[i] doubleValue] : 40.0;
+        if (clickY >= top && clickY <= top + h) {
+            hitIndex = i;
+            break;
+        }
+    }
+
+    if (hitIndex >= 0 && hitIndex < (NSInteger)self.lines.count) {
+        double seekTime = self.lines[hitIndex].time;
+        if (seekTime >= 0 && self.onSeekToSeconds) {
+            self.onSeekToSeconds(seekTime);
+        }
+    }
+}
+
 - (void)drawRect:(NSRect)dirtyRect {
     NSRect b = self.bounds;
-    NSColor *bgColor = [NSColor colorWithCalibratedWhite:0.075 alpha:1];
+    // 底色用和 NMP 主窗一致的近黑（由控制器注入），边缘渐隐也用它
+    NSColor *bgColor = self.bgColor ?: [NSColor colorWithCalibratedWhite:0.075 alpha:1];
     [bgColor setFill];
     NSRectFill(b);
 
@@ -350,7 +522,7 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
     }
 
     CGFloat fs = self.fontSize;
-    CGFloat maxWidth = MAX(160, b.size.width - 72);
+    CGFloat maxWidth = MAX(160, b.size.width - 44);
     if (!_textH) _textH = [NSMutableDictionary dictionary];
     if (fabs(fs - _cacheFS) > 0.4 || fabs(maxWidth - _cacheW) > 0.4) {
         [_textH removeAllObjects];
@@ -362,69 +534,179 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
     NSInteger active = MIN(MAX(0, self.activeIndex), count - 1);
     BOOL started = !self.beforeStart;
 
+    BOOL isLeft = (self.alignmentIndex == 1);
     NSMutableParagraphStyle *para = [NSMutableParagraphStyle new];
-    para.alignment = NSTextAlignmentCenter;
+    para.alignment = isLeft ? NSTextAlignmentLeft : NSTextAlignmentCenter;
     para.lineBreakMode = NSLineBreakByWordWrapping;
-    para.lineSpacing = fs * 0.16;   // 折行时行与行别贴在一起（英文尤其明显）
+    para.lineSpacing = fs * 0.16;
 
-    // ── 布局：只量「还没量过的 (行号, 档位)」，其余走缓存 ──
+    // ── Apple Music 行间平滑过渡时序推进（0.38s Cubic Smoothstep 缓动）──
+    if (_transitionProgress < 1.0) {
+        _transitionProgress += (1.0 / 60.0) / 0.38;
+        if (_transitionProgress > 1.0) _transitionProgress = 1.0;
+    }
+    CGFloat easeT = 1.0;
+    if (_transitionProgress < 1.0) {
+        CGFloat p = _transitionProgress;
+        easeT = p * p * (3.0 - 2.0 * p);
+    }
+
+    // ── 间奏：三个呼吸的点 ──
+    CGFloat dotK = self.showDots ? self.dotFade : 0;
+    CGFloat dotBlockH = fs * 0.95;
+
+    // ── 稳定基准槽位布局（槽位绝对固定，消除行高跳变与排版颠簸）──
     NSMutableArray<NSNumber *> *tops = [NSMutableArray arrayWithCapacity:count];
     NSMutableArray<NSNumber *> *slotHs = [NSMutableArray arrayWithCapacity:count];
     CGFloat total = 0, activeSlotH = 0, activeTextH = 0;
+    CGFloat gap = fs * 0.44;
+
     for (NSInteger i = 0; i < count; i++) {
-        NSInteger cls = MIN(4, (NSInteger)labs(i - active));
-        CGFloat textH = [self textHeightAtIndex:i cls:cls fs:fs width:maxWidth para:para];
-        CGFloat gap = fs * (cls == 0 ? 0.62 : 0.34);
-        CGFloat slotH = textH + gap * 2;
+        CGFloat textH = [self textHeightAtIndex:i fs:fs width:maxWidth para:para];
+        CGFloat slotH = textH + gap * 2.0;
         [tops addObject:@(total)];
         [slotHs addObject:@(slotH)];
         total += slotH;
-        if (i == active) { activeSlotH = slotH; activeTextH = textH; }
+        if (i == active) {
+            activeSlotH = slotH;
+            activeTextH = textH;
+            if (dotK > 0.02) total += dotBlockH * dotK;
+        }
     }
 
-    // 当前行中心落在窗口 42% 高处，平滑跟随
-    CGFloat target = [tops[active] doubleValue] + activeSlotH / 2 - b.size.height * 0.42;
-    target = MIN(MAX(0, target), MAX(0, total - b.size.height));
-    _scrollY += (target - _scrollY) * 0.22;
-    if (!isfinite(_scrollY)) _scrollY = target;
-    self.animating = fabs(target - _scrollY) > 0.4;
+    // 当前行中心落在窗口 42% 黄金视觉焦点高度
+    CGFloat focusY = b.size.height * 0.42;
 
-    // ── 绘制：屏幕外的行直接跳过（这是帧率提升的主要来源） ──
+    CGFloat dotD = MAX(6.0, fs * 0.28);
+    CGFloat dotPitch = dotD * 2.2;
+    CGFloat activeTextCenter = [tops[active] doubleValue] + activeSlotH / 2.0;
+    CGFloat dotsCenterY = activeTextCenter + activeTextH / 2.0 + (dotBlockH * dotK) / 2.0;
+
+    CGFloat focusContentY = (dotK > 0.02 && started) ? dotsCenterY : activeTextCenter;
+    CGFloat target = focusContentY - focusY;
+    CGFloat minY = -focusY;
+    CGFloat maxY = MAX(minY, total - focusY);
+    target = MIN(MAX(minY, target), maxY);
+
+    if (self.forceSettle) {
+        _scrollY = target;
+        _scrollVelocity = 0;
+        self.forceSettle = NO;
+    } else {
+        // Apple Music 官方标志性物理弹簧系统
+        // response ~ 0.38s, dampingFraction ~ 0.75 (stiffness k = 210, damping c = 22.0)
+        // 呈现约 5%~7% 灵动自然微超调弹性与丝滑软着陆（宛如悬浮水面）
+        CGFloat diff = target - _scrollY;
+        CGFloat springK = 210.0;
+        CGFloat dampingC = 22.0;
+        CGFloat dt = 1.0 / 60.0;
+
+        CGFloat springForce = springK * diff;
+        CGFloat dampingForce = -dampingC * _scrollVelocity;
+        CGFloat accel = springForce + dampingForce;
+
+        _scrollVelocity += accel * dt;
+        _scrollY += _scrollVelocity * dt;
+
+        if (!isfinite(_scrollY) || fabs(diff) > 2500) {
+            _scrollY = target;
+            _scrollVelocity = 0;
+        }
+    }
+    self.animating = (_transitionProgress < 1.0 || fabs(target - _scrollY) > 0.1 || fabs(_scrollVelocity) > 0.1);
+
+    _lineTops = [tops copy];
+    _lineHeights = [slotHs copy];
+
+    // ── 绘制：屏幕外的行直接跳过（视口裁剪） ──
     for (NSInteger i = 0; i < count; i++) {
         CGFloat slotTop = [tops[i] doubleValue] - _scrollY;
         CGFloat slotH = [slotHs[i] doubleValue];
-        if (slotTop + slotH < -20 || slotTop > b.size.height + 20) continue;
+        if (slotTop + slotH < -40 || slotTop > b.size.height + 40) continue;
 
-        BOOL isCurrent = (i == active) && started;
-        CGFloat textH = slotH - fs * (i == active ? 1.24 : 0.68);
-        CGFloat top = slotTop + (slotH - textH) / 2;
+        CGFloat textH = [_textH[@(i)] doubleValue];
+        CGFloat top = slotTop + (slotH - textH) / 2.0;
 
-        if (isCurrent) {
-            // 暗底（未唱色）+ 亮层按「字符位置」填充 —— 位置是小数，
-            // 所以一个字还没唱完就能填一半，看起来才是卡拉 OK 那种推着走的光带。
-            NSAttributedString *dim = [self currentLine:lines[i] fs:fs para:para bright:NO];
-            [self drawText:dim width:maxWidth top:top prefix:NSUIntegerMax];
+        // 计算当前行的连续焦点权重 weight ∈ [0, 1]
+        CGFloat weight = 0.0;
+        if (i == active) {
+            weight = (_prevActiveIndex >= 0) ? easeT : 1.0;
+        } else if (i == _prevActiveIndex) {
+            weight = 1.0 - easeT;
+        }
 
-            NSAttributedString *bright = [self currentLine:lines[i] fs:fs para:para bright:YES];
+        // Apple Music 比例体系：
+        // 焦点行 scale 1.00, alpha 1.00
+        // 相邻行 scale 0.84, alpha 0.42
+        // 远距离行 scale 0.76, alpha 0.22
+        NSInteger dist = labs(i - active);
+        CGFloat baseScale = (dist <= 1) ? 0.84 : 0.76;
+        CGFloat baseAlpha = (dist <= 1) ? 0.42 : 0.22;
+        CGFloat lineScale = baseScale + (1.00 - baseScale) * weight;
+        CGFloat lineAlpha = baseAlpha + (1.00 - baseAlpha) * weight;
+
+        CGFloat x0 = floor((b.size.width - maxWidth) / 2);
+        CGFloat cx = isLeft ? (x0 + 16.0) : (b.size.width / 2.0);
+        CGFloat cy = top + textH / 2.0;
+
+        CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
+        CGContextSaveGState(ctx);
+
+        // 以每行几何中心为锚点做 GPU 平滑缩放与呼吸过渡（完全避免文字折行跳动）
+        CGContextTranslateCTM(ctx, cx, cy);
+        CGContextScaleCTM(ctx, lineScale, lineScale);
+        CGContextTranslateCTM(ctx, -cx, -cy);
+
+        if (i == active && started) {
+            CGFloat dim = (1.0 - 0.45 * dotK) * lineAlpha;
+            NSAttributedString *dimText = [self currentLine:lines[i] fs:fs para:para bright:NO alpha:dim];
+            [self drawText:dimText width:maxWidth top:top prefix:NSUIntegerMax];
+
+            NSAttributedString *bright = [self currentLine:lines[i] fs:fs para:para bright:YES alpha:dim];
             CGFloat cp = [self charPosForLine:lines[i]];
-            if (cp > 0.02) [self drawKaraoke:bright width:maxWidth top:top charPos:cp];
+            if (cp > 0.02) {
+                [self drawKaraoke:bright width:maxWidth top:top charPos:cp];
+            }
+        } else if (i == _prevActiveIndex && started && weight > 0.01) {
+            // 上一句正在平滑退场：保持已唱完纯白高亮，伴随过渡平滑收缩并淡化成次级灰色
+            NSAttributedString *as = [self currentLine:lines[i] fs:fs para:para bright:YES alpha:lineAlpha];
+            [self drawText:as width:maxWidth top:top prefix:NSUIntegerMax];
         } else {
-            NSInteger cls = MIN(4, (NSInteger)labs(i - active));
-            NSFont *f = [NSFont systemFontOfSize:fs * NMPClassScale(cls)
-                                          weight:(cls <= 1 ? NSFontWeightSemibold
-                                                           : NSFontWeightRegular)];
+            // 普通非焦点行
+            NSFont *f = [NSFont systemFontOfSize:fs weight:[self inactiveWeightForDist:dist]];
             NSAttributedString *as = [[NSAttributedString alloc]
                 initWithString:lines[i].text attributes:@{
                     NSFontAttributeName: f,
-                    NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:1.0
-                                                                               alpha:NMPClassAlpha(cls)],
+                    NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:1.0 alpha:lineAlpha],
                     NSParagraphStyleAttributeName: para}];
             [self drawText:as width:maxWidth top:top prefix:NSUIntegerMax];
+        }
+
+        CGContextRestoreGState(ctx);
+    }
+
+    // ── 间奏：三个呼吸的点，独占一行落在焦点上 ──
+    if (dotK > 0.02 && started) {
+        CGFloat cy = dotsCenterY - _scrollY;
+        CGFloat totalW = dotPitch * 2 + dotD;
+        CGFloat x0 = floor((b.size.width - maxWidth) / 2);
+        CGFloat cx = isLeft ? (x0 + dotD / 2 + 10) : ((b.size.width - totalW) / 2 + dotD / 2);
+        if (cy > -dotD * 2 && cy < b.size.height + dotD * 2) {
+            double t = self.dotPhase * 2.0;              // 一个循环约 3.1 秒
+            for (int k = 0; k < 3; k++) {
+                double w = 0.5 + 0.5 * sin(t - k * 0.9);
+                double e = pow(w, 2.2);                   // 亮峰收窄，光在三点之间走
+                CGFloat a = (0.30 + 0.70 * e) * dotK;
+                CGFloat d = dotD * (1.0 + 0.08 * e);      // 亮的时候微微放大
+                [[NSColor colorWithCalibratedWhite:1.0 alpha:a] setFill];
+                NSRect r = NSMakeRect(cx + k * dotPitch - d / 2, cy - d / 2, d, d);
+                [[NSBezierPath bezierPathWithOvalInRect:r] fill];
+            }
         }
     }
 
     // ── 上下渐隐（同色遮罩，渐变对象按高度缓存） ──
-    CGFloat fade = MIN(100, b.size.height * 0.15);
+    CGFloat fade = MIN(150, b.size.height * 0.22);
     if (!_gTop || fabs(fade - _gHeight) > 0.5) {
         _gTop = [[NSGradient alloc] initWithStartingColor:[bgColor colorWithAlphaComponent:1]
                                               endingColor:[bgColor colorWithAlphaComponent:0]];
@@ -436,20 +718,18 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
     [_gBot drawInRect:NSMakeRect(0, b.size.height - fade, b.size.width, fade) angle:90];
 }
 
-// 文字高度缓存：同一行的同一个档位只量一次
-- (CGFloat)textHeightAtIndex:(NSInteger)i cls:(NSInteger)cls fs:(CGFloat)fs
+- (CGFloat)textHeightAtIndex:(NSInteger)i fs:(CGFloat)fs
                        width:(CGFloat)maxWidth para:(NSParagraphStyle *)para {
-    NSNumber *key = @(i * 8 + cls);
+    NSNumber *key = @(i);
     NSNumber *hit = _textH[key];
     if (hit) return hit.doubleValue;
-    NSFont *f = [NSFont systemFontOfSize:fs * NMPClassScale(cls)
-                                  weight:(cls <= 1 ? NSFontWeightSemibold : NSFontWeightRegular)];
+    NSFont *f = [NSFont systemFontOfSize:fs weight:[self activeWeight]];
     NSAttributedString *probe = [[NSAttributedString alloc]
         initWithString:self.lines[i].text
             attributes:@{NSFontAttributeName: f, NSParagraphStyleAttributeName: para}];
     CGFloat h = [probe boundingRectWithSize:NSMakeSize(maxWidth, CGFLOAT_MAX)
                                     options:NSStringDrawingUsesLineFragmentOrigin].size.height;
-    h = MAX(h, fs * NMPClassScale(cls) * 1.18);
+    h = MAX(h, fs * 1.20);
     _textH[key] = @(h);
     return h;
 }
@@ -458,12 +738,21 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
 /// 唱到哪儿完全由遮罩决定（逐词着色会和扫光打架，反而看不出进度）。
 - (NSAttributedString *)currentLine:(NMPLine *)line fs:(CGFloat)fs
                                para:(NSParagraphStyle *)para bright:(BOOL)bright {
-    NSColor *color = bright ? [NSColor colorWithCalibratedWhite:1.0 alpha:1]
-                            : [NSColor colorWithCalibratedWhite:0.32 alpha:1];
+    return [self currentLine:line fs:fs para:para bright:bright alpha:1.0];
+}
+
+/// 同上，alpha 用来在间奏时把唱完那句压暗（颜色里带 alpha 才真的压得下去，
+/// 光设 CGContext 的全局 alpha 对 NSAttributedString 绘制不生效）。
+- (NSAttributedString *)currentLine:(NMPLine *)line fs:(CGFloat)fs
+                               para:(NSParagraphStyle *)para bright:(BOOL)bright
+                              alpha:(CGFloat)alpha {
+    NSColor *color = bright ? [NSColor colorWithCalibratedWhite:1.0 alpha:alpha]
+                            : [NSColor colorWithCalibratedWhite:0.32 alpha:alpha];
     return [[NSAttributedString alloc] initWithString:line.text attributes:@{
-        NSFontAttributeName: [NSFont systemFontOfSize:fs weight:NSFontWeightBold],
+        NSFontAttributeName: [NSFont systemFontOfSize:fs weight:[self activeWeight]],
         NSForegroundColorAttributeName: color,
-        NSParagraphStyleAttributeName: para}];
+        NSParagraphStyleAttributeName: para,
+        NSKernAttributeName: @(-0.4)}];
 }
 
 /// 已经唱到「第几个字」—— 返回值带小数：3.4 表示第 3 个字唱了 40%。
@@ -480,8 +769,8 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
     return base + wl * p;
 }
 
-/// 卡拉 OK 扫光：按行分段裁剪，行内裁剪点随「字符位置」连续移动。
-/// 字符位置是小数，所以一个字能被填到一半 —— 这才是卡拉 OK 那条推着走的光带。
+/// 卡拉 OK 扫光：按行分段裁剪，行内裁剪点随「字符位置」连续平滑推进。
+/// 字符位置是小数，字内连续平滑推进（经典 KTV 流水推字，不逐字弹跳）。
 - (void)drawKaraoke:(NSAttributedString *)bright width:(CGFloat)maxWidth
                 top:(CGFloat)top charPos:(CGFloat)charPos {
     NSUInteger len = bright.length;
@@ -511,12 +800,10 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
         NSRect fr = [lm lineFragmentRectForGlyphAtIndex:g effectiveRange:&lr];
         CGFloat left = fr.origin.x, right = fr.origin.x + fr.size.width;
         CGFloat endX = -1;
-        BOOL partial = NO;
         if (NSMaxRange(lr) <= gi) {
             endX = right;                                   // 整行唱过
         } else if (lr.location <= gi && gi < NSMaxRange(lr)) {
             endX = MIN(right, MAX(left, sweepX));           // 正在唱的这一行
-            partial = YES;
         } else {
             break;                                          // 后面的行不发光
         }
@@ -593,8 +880,15 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
 @property (nonatomic, strong) NSArray<NMPLine *> *pendingLines;
 @property (nonatomic, assign) double pendingOffset;
 @property (nonatomic, assign) double lrcOffset;
+@property (nonatomic, assign) double cadence;   // 本曲「每字唱多久」的估计，间奏门槛按它缩放
 
 @property (nonatomic) AXUIElementRef appElement;
+@property (nonatomic, strong) dispatch_queue_t axQueue;   // AX 兜底专用后台队列
+@property (nonatomic, assign) NSInteger viewFailStreak;   // 视图直读连续失手次数
+@property (nonatomic, copy)   NSString *axTitle;          // 后台 AX 捎回的曲名（低频）
+@property (nonatomic, copy)   NSString *axArtist;
+@property (nonatomic, copy)   NSString *axPlay;
+@property (nonatomic, assign) NSInteger axPollTick;       // AX 取曲名的节流计数
 @end
 
 // 标题栏里那个「歌词」按钮：默认 NSButton 即可，没有额外行为
@@ -620,10 +914,21 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
         _appElement = AXUIElementCreateApplication(getpid());
         // 默认 6 秒：NMP 在分析新歌时一次 AX 查询可能挂很久，页面就跟着冻住。
         // 压到 1 秒，读不到就等下一轮，宁可少一帧数据也不要卡 UI。
+        // 注意：现在 AX 已挪到后台队列，这个超时只影响兜底路径的响应速度。
         AXUIElementSetMessagingTimeout(_appElement, 1.0);
+
+        // AX 兜底专用串行队列：低优先级，绝不和界面抢
+        _axQueue = dispatch_queue_create("com.renjoy.nmp.axfallback",
+                                         dispatch_queue_attr_make_with_qos_class(
+                                             DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
         [self buildWindow];
         [self observeMenus];
         [self installLyricsHotkey];
+        // 窗口改尺寸时立刻重排按钮，不等下一轮 poll —— 拖动改宽时就不会「延迟回位」
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(hostWindowGeometryChanged:)
+                                                     name:NSWindowDidResizeNotification
+                                                   object:nil];
         
         _pollTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 target:self
                                                     selector:@selector(poll) userInfo:nil repeats:YES];
@@ -632,76 +937,282 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
                                              selector:@selector(render) userInfo:nil repeats:YES];
         _renderTimer.tolerance = 0.004;
         [[NSRunLoop mainRunLoop] addTimer:_renderTimer forMode:NSRunLoopCommonModes];
+
+        // 调试：启动时自动弹出歌词窗，方便截图核对样式
+        BOOL wantShow = (getenv("NMP_SHOW_LYRICS") != NULL) ||
+                        [[NSUserDefaults standardUserDefaults] boolForKey:@"NMPAutoShowLyrics"];
+        for (NSString *a in [NSProcessInfo processInfo].arguments) {
+            if ([a isEqualToString:@"--show-lyrics"]) wantShow = YES;
+        }
+        if (wantShow) {
+            NMPLog(@"auto-open lyrics window (args=%@)", [NSProcessInfo processInfo].arguments);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [self toggleWindow:nil];
+                // 调试：NMP_PREVIEW_DOTS=1 时灌一份假歌词停在间奏上，方便截图核对
+                if (getenv("NMP_PREVIEW_DOTS") ||
+                    [[NSUserDefaults standardUserDefaults] boolForKey:@"NMPPreviewDots"]) {
+                    [_renderTimer invalidate];
+                    _renderTimer = nil;
+                    [self startDotsPreview];
+                }
+            });
+        }
     }
     return self;
 }
 
 // ---------------------------------------------------------------- 窗口
 
+// 调试用：灌一份假歌词，把画面停在「第四句刚唱完、进间奏」的一刻，
+// 用来截图核对三个点的大小和焦点位置。只在 NMP_PREVIEW_DOTS=1 时调用。
+- (void)startDotsPreview {
+    NSArray<NSString *> *texts = @[@"夜色渐浓风声也轻", @"我听见远处传来回音",
+                                   @"谁的影子落在窗棂", @"唱完这句就进间奏了",
+                                   @"间奏结束又开始唱", @"时间继续往前走"];
+    NSMutableArray<NMPLine *> *demo = [NSMutableArray array];
+    for (NSUInteger i = 0; i < texts.count; i++) {
+        NMPLine *l = [NMPLine new];
+        l.time = i * 4.0;
+        l.text = texts[i];
+        l.duration = 3.4;
+        l.timed = YES;
+        [demo addObject:l];
+    }
+    _stage.lines = demo;
+    _stage.activeIndex = 3;
+    _stage.activeWord = -1;
+    _stage.activeProgress = 1.0;
+    _stage.beforeStart = NO;
+    _stage.showDots = YES;
+    _stage.dotFade = 1.0;
+    _stage.dotPhase = 1.05;      // 停在一个点最亮的位置
+    _stage.animating = NO;
+    // 渲染循环已经停了，滚动不会自己收敛；等窗口布局定下来再强制落位，
+    // 否则截出来的是「焦点还没走到点上」的中间状态。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        self.stage.forceSettle = YES;
+        [self.stage display];
+    });
+}
+
 - (void)buildWindow {
     // 独立歌词窗：不绑任何窗口，拖到副屏投影、拉大缩小都随你。
     // 界面里没有设置条 —— 只留歌词本身，字号完全跟着窗口缩放。
-    NSColor *bgBlack = [NSColor colorWithCalibratedWhite:0.045 alpha:1];
+    // 用 macOS 深色窗口底色的标准值（NMP 主窗就是这个颜色），
+    // 两个窗口摆在一起才是一套 UI。之前自己调的 0.075 灰度偏暗一档。
+    NSColor *bgBlack = [NSColor colorWithSRGBRed:19/255.0 green:21/255.0
+                                               blue:22/255.0 alpha:1.0];
 
     NSWindow *win = [[NSWindow alloc]
         initWithContentRect:NSMakeRect(0, 0, 1000, 560)
-                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
-                          | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable
+                  styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                          | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable)
                     backing:NSBackingStoreBuffered defer:NO];
     win.releasedWhenClosed = NO;   // 红钮只隐藏不销毁，否则 _lyricsWindow 变野指针
     win.title = @"歌词";
     win.delegate = self;
     win.minSize = NSMakeSize(360, 220);
     win.backgroundColor = bgBlack;
-    win.titlebarAppearsTransparent = YES;
+    // 标题栏保持透明，但这次是让「内容视图自己的底色」透上来 —— 系统标题栏
+    // 在非透明模式下用的是自带的材质，那个颜色改不了，和歌词区永远差一截。
+    // 内容视图铺满整个窗口（含标题栏后面）并涂同一个底色，标题栏就不再是
+    // 一个突兀的浅色条；歌词则被限制在标题栏下方（见下面的 contentLayoutRect）。
+    win.titlebarAppearsTransparent = NO;
+    if (@available(macOS 11.0, *)) {
+        win.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
+    }
     win.titleVisibility = NSWindowTitleVisible;
     [win setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+    win.contentView.wantsLayer = YES;
+    win.contentView.layer.backgroundColor = bgBlack.CGColor;
 
+    // 歌词只画在标题栏下方这块区域里（手动算：全尺寸窗口下 autoresizing
+    // 会把视图拉到标题栏后面，红绿灯就被盖住了）
     NMPStageView *stage = [[NMPStageView alloc] initWithFrame:win.contentView.bounds];
     stage.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    stage.bgColor = bgBlack;
+    __weak typeof(self) weakSelf = self;
+    stage.onSeekToSeconds = ^(double sec) {
+        [weakSelf seekToSeconds:sec];
+    };
     [win.contentView addSubview:stage];
     _stage = stage;
 
-    // ── 字号滑条：右下角一小条，不占歌词布局（窗口缩放依然有效，这里调的是倍率）──
+    // ── 上下边缘渐隐 ──
+    // 早先试过叠一层 NSVisualEffectView 做真模糊，但它的材质在这个窗口里
+    // 会把边缘提亮成一条横带，反而更脏。改成两段缓动渐变，滚出视野的字
+    // 先慢后快地淡掉，观感已经够接近音乐播放器。
+    CGFloat fadeH = 0;
+
+    // ── 悬停控制胶囊：鼠标移进窗口才淡入，含字号、字重、排版对齐、窗口置顶 ──
     CGFloat saved = [[NSUserDefaults standardUserDefaults] doubleForKey:kPrefFontScale];
     if (saved < 0.5 || saved > 2.1) saved = 1.0;
 
+    NSInteger savedWeight = [[NSUserDefaults standardUserDefaults] integerForKey:kPrefFontWeight];
+    if (savedWeight < 0 || savedWeight > 3) savedWeight = 2; // 默认粗体 (Bold)
+
+    NSInteger savedAlign = [[NSUserDefaults standardUserDefaults] integerForKey:kPrefAlignment];
+    if (savedAlign < 0 || savedAlign > 1) savedAlign = 0; // 默认居中
+
+    BOOL savedOnTop = [[NSUserDefaults standardUserDefaults] boolForKey:kPrefOnTop];
+    if (savedOnTop) win.level = NSFloatingWindowLevel;
+
+    CGFloat barW = 560;
+    CGFloat barH = 38;
+    NSView *bar = [[NSView alloc] initWithFrame:
+                   NSMakeRect((win.contentView.bounds.size.width - barW) / 2, 14, barW, barH)];
+    bar.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMaxYMargin;
+    bar.wantsLayer = YES;
+    bar.layer.backgroundColor = [NSColor colorWithCalibratedWhite:0.12 alpha:0.90].CGColor;
+    bar.layer.cornerRadius = 19.0;
+    bar.layer.borderWidth = 1.0;
+    bar.layer.borderColor = [NSColor colorWithCalibratedWhite:1.0 alpha:0.14].CGColor;
+    bar.layer.masksToBounds = YES;
+    bar.alphaValue = 0.0;
+    [win.contentView addSubview:bar];
+
+    // 1. 字号
+    NSTextField *scTitle = [self makeHUDLabel:@"字号" frame:NSMakeRect(14, 11, 28, 16)];
+    [bar addSubview:scTitle];
+
     NSSlider *sl = [NSSlider sliderWithValue:saved minValue:0.6 maxValue:2.0
                                       target:self action:@selector(fontScaleChanged:)];
-    sl.frame = NSMakeRect(win.contentView.bounds.size.width - 168, 14, 140, 18);
-    sl.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    sl.frame = NSMakeRect(44, 10, 96, 18);
     sl.controlSize = NSControlSizeSmall;
-    sl.alphaValue = 0.55;
-    [win.contentView addSubview:sl];
+    [bar addSubview:sl];
     _scaleSlider = sl;
 
-    NSTextField *scLab = [[NSTextField alloc] initWithFrame:
-                          NSMakeRect(win.contentView.bounds.size.width - 206, 15, 34, 16)];
-    scLab.editable = NO;
-    scLab.bordered = NO;
-    scLab.drawsBackground = NO;
-    scLab.selectable = NO;
-    scLab.font = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular];
-    scLab.textColor = [NSColor colorWithCalibratedWhite:0.62 alpha:1];
-    scLab.alignment = NSTextAlignmentRight;
-    scLab.stringValue = [NSString stringWithFormat:@"%.1f×", saved];
-    scLab.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    [win.contentView addSubview:scLab];
+    NSTextField *scLab = [self makeHUDValueLabel:[NSString stringWithFormat:@"%.1f×", saved]
+                                           frame:NSMakeRect(142, 11, 34, 16)];
+    [bar addSubview:scLab];
     _scaleLabel = scLab;
 
+    // 分割线 1
+    [bar addSubview:[self makeHUDSeparatorAtX:184]];
+
+    // 2. 字重
+    NSTextField *wtTitle = [self makeHUDLabel:@"字重" frame:NSMakeRect(194, 11, 28, 16)];
+    [bar addSubview:wtTitle];
+
+    NSSegmentedControl *wtSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"常规", @"中黑", @"粗体", @"特粗"]
+                                                                  trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                                        target:self
+                                                                        action:@selector(fontWeightChanged:)];
+    wtSeg.frame = NSMakeRect(224, 8, 144, 22);
+    wtSeg.controlSize = NSControlSizeSmall;
+    wtSeg.selectedSegment = savedWeight;
+    [bar addSubview:wtSeg];
+
+    // 分割线 2
+    [bar addSubview:[self makeHUDSeparatorAtX:378]];
+
+    // 3. 排版对齐
+    NSTextField *alTitle = [self makeHUDLabel:@"排版" frame:NSMakeRect(388, 11, 28, 16)];
+    [bar addSubview:alTitle];
+
+    NSSegmentedControl *alSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"居中", @"靠左"]
+                                                                  trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                                        target:self
+                                                                        action:@selector(alignmentChanged:)];
+    alSeg.frame = NSMakeRect(418, 8, 76, 22);
+    alSeg.controlSize = NSControlSizeSmall;
+    alSeg.selectedSegment = savedAlign;
+    [bar addSubview:alSeg];
+
+    // 分割线 3
+    [bar addSubview:[self makeHUDSeparatorAtX:504]];
+
+    // 4. 置顶
+    NSSegmentedControl *topSeg = [NSSegmentedControl segmentedControlWithLabels:@[@"置顶"]
+                                                                   trackingMode:NSSegmentSwitchTrackingSelectAny
+                                                                         target:self
+                                                                         action:@selector(onTopToggled:)];
+    topSeg.frame = NSMakeRect(512, 8, 38, 22);
+    topSeg.controlSize = NSControlSizeSmall;
+    [topSeg setSelected:savedOnTop forSegment:0];
+    [bar addSubview:topSeg];
+
+    stage.hoverBar = bar;
     stage.fontScale = saved;
+    stage.fontWeightIndex = savedWeight;
+    stage.alignmentIndex = savedAlign;
 
     [win center];
     _lyricsWindow = win;
+    [self layoutStage];
+}
+
+- (NSTextField *)makeHUDLabel:(NSString *)text frame:(NSRect)frame {
+    NSTextField *tf = [[NSTextField alloc] initWithFrame:frame];
+    tf.editable = NO;
+    tf.bordered = NO;
+    tf.drawsBackground = NO;
+    tf.selectable = NO;
+    tf.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+    tf.textColor = [NSColor colorWithCalibratedWhite:0.65 alpha:1.0];
+    tf.stringValue = text;
+    return tf;
+}
+
+- (NSTextField *)makeHUDValueLabel:(NSString *)text frame:(NSRect)frame {
+    NSTextField *tf = [[NSTextField alloc] initWithFrame:frame];
+    tf.editable = NO;
+    tf.bordered = NO;
+    tf.drawsBackground = NO;
+    tf.selectable = NO;
+    tf.font = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular];
+    tf.textColor = [NSColor colorWithCalibratedWhite:0.85 alpha:1.0];
+    tf.alignment = NSTextAlignmentRight;
+    tf.stringValue = text;
+    return tf;
+}
+
+- (NSBox *)makeHUDSeparatorAtX:(CGFloat)x {
+    NSBox *box = [[NSBox alloc] initWithFrame:NSMakeRect(x, 10, 1, 18)];
+    box.boxType = NSBoxCustom;
+    box.borderType = NSNoBorder;
+    box.fillColor = [NSColor colorWithCalibratedWhite:1.0 alpha:0.15];
+    return box;
+}
+
+// 歌词区避开标题栏：全尺寸内容窗口里 safeAreaInsets.top 就是标题栏高度。
+// 拿不到（刚创建还没布局）就先按标准 28pt 兜底，窗口一显示会再算一次。
+- (void)layoutStage {
+    if (!_stage || !_lyricsWindow) return;
+    NSView *cv = _lyricsWindow.contentView;
+    if (!cv) return;
+    NSRect r = cv.bounds;
+    if (!NSEqualRects(_stage.frame, r)) _stage.frame = r;
 }
 
 - (void)fontScaleChanged:(NSSlider *)sender {
     CGFloat v = sender.doubleValue;
     _stage.fontScale = v;
     _scaleLabel.stringValue = [NSString stringWithFormat:@"%.1f×", v];
-    sender.alphaValue = 0.9;
     [[NSUserDefaults standardUserDefaults] setDouble:v forKey:kPrefFontScale];
     [_stage setNeedsDisplay:YES];
+}
+
+- (void)fontWeightChanged:(NSSegmentedControl *)sender {
+    NSInteger idx = sender.selectedSegment;
+    _stage.fontWeightIndex = idx;
+    [[NSUserDefaults standardUserDefaults] setInteger:idx forKey:kPrefFontWeight];
+    [_stage setNeedsDisplay:YES];
+}
+
+- (void)alignmentChanged:(NSSegmentedControl *)sender {
+    NSInteger idx = sender.selectedSegment;
+    _stage.alignmentIndex = idx;
+    [[NSUserDefaults standardUserDefaults] setInteger:idx forKey:kPrefAlignment];
+    [_stage setNeedsDisplay:YES];
+}
+
+- (void)onTopToggled:(NSSegmentedControl *)sender {
+    BOOL on = [sender isSelectedForSegment:0];
+    _lyricsWindow.level = on ? NSFloatingWindowLevel : NSNormalWindowLevel;
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kPrefOnTop];
 }
 
 // NMP 主窗健康保险：NMP 记得窗口「缩到极小/拖出屏」的状态后就再也不回来，
@@ -998,10 +1509,26 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
 }
 
 - (NSWindow *)hostWindow {
+    NSWindow *fallback = nil;
+    CGFloat bestArea = 0;
     for (NSWindow *w in [NSApp windows]) {
-        if ([w.title isEqualToString:@"Neural Mix"] && w.isVisible) return w;
+        if (!w.isVisible) continue;
+        if (w == _lyricsWindow) continue;                       // 别把歌词窗当宿主
+        if (!(w.styleMask & NSWindowStyleMaskTitled)) continue;
+        NSString *t = w.title ?: @"";
+        // 正常路径：NMP 主窗口标题里带 "Neural Mix"
+        if ([t containsString:@"Neural Mix"]) return w;
+        // 退路：标题被本地化改写、或版本换了标题时，取面积最大的带标题窗口（就是主窗口）。
+        // 原来只认 isEqualToString:@"Neural Mix"，标题一变就永远返回 nil
+        // —— 按钮不出现、⌘L 也没有，看起来就像"补丁没生效"。
+        CGFloat area = w.frame.size.width * w.frame.size.height;
+        if (area > bestArea) { bestArea = area; fallback = w; }
     }
-    return nil;
+    if (fallback) {
+        static BOOL logged = NO;
+        if (!logged) { logged = YES; NMPLog(@"hostWindow fallback -> \"%@\"", fallback.title); }
+    }
+    return fallback;
 }
 
 - (void)normalizeHostWindow:(NSWindow *)w {
@@ -1039,14 +1566,98 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
 
 - (void)poll {
     if (!_appElement) return;
-    NSString *title = @"", *artist = @"", *elapsedText = @"", *remainingText = @"", *playBtnTitle = @"";
-    double fraction = 0;
 
+    NSString *title = @"", *artist = @"", *elapsedText = @"", *remainingText = @"", *playBtnTitle = @"";
+
+    // ── 路径一：同进程视图直读（主线程、零 IPC、微秒级）──
+    // 这才是「自己读自己界面」该有的样子：界面就是 NSView 树，直接读 stringValue。
+    BOOL got = [self readFromViewsTitle:&title artist:&artist elapsed:&elapsedText
+                              remaining:&remainingText playTitle:&playBtnTitle];
+
+    if (!got) {
+        // 标签匹配不上：实测 NMP 的 "Elapsed time" 是 AX 层运行时生成的，
+        // AppKit 的 accessibilityDescription 是空的。退一步用「时间格式 + 兄弟配对」
+        // 认出进度条那两个数字 —— 歌词只需要进度，这一步就够。
+        NSString *el = @"", *rem = @"";
+        if ([self readTimesFromViewsElapsed:&el remaining:&rem]) {
+            elapsedText = el;
+            remainingText = rem;
+            title = _axTitle ?: @"";
+            artist = _axArtist ?: @"";
+            playBtnTitle = _axPlay ?: @"";
+            got = YES;
+        }
+    }
+
+    if (got) {
+        _viewFailStreak = 0;
+        [self applyState:title artist:artist elapsed:elapsedText
+               remaining:remainingText play:playBtnTitle];
+        // 曲名/演奏状态变化很慢，不必每 0.1 秒都去问一次 —— 1 秒一次足够
+        if (++_axPollTick >= 10) { _axPollTick = 0; [self refreshMetaViaAXAsync]; }
+    } else {
+        // ── 路径二：整轮 AX 兜底，放后台，主线程永不等它 ──
+        if (_viewFailStreak < 3 && ++_viewFailStreak == 3) {
+            NMPLog(@"视图直读未命中，改用 AX 后台兜底");
+            // 排查用：NMP_DUMP_VIEWS=1 启动时把视图树打进日志，
+            // 用来确认文字到底在哪种控件里、无障碍标签是什么。
+            if (getenv("NMP_DUMP_VIEWS")) [self dumpViews];
+        }
+        [self pollViaAXAsync];
+    }
+
+    // 按钮要先于 title 检查：没歌时也要能呼出歌词窗
+    [self ensureHostButton];
+    // 主窗健康复位放在 10Hz 的 poll 里做就够了，别占 60fps 的渲染循环
+    [self normalizeHostWindow:[self hostWindow]];
+}
+
+// AX 兜底：整轮跑在后台串行队列上。主线程只负责在结果回来后更新状态，
+// 永远不会再等 XPC —— 这就是「点暂停卡 5 秒」的根治点。
+- (void)pollViaAXAsync {
+    static BOOL busy = NO;
+    if (busy) return;          // 上一轮没回来就别叠加，避免队列堆积
+    busy = YES;
+    dispatch_async(_axQueue, ^{
+        NSString *title = @"", *artist = @"", *elapsedText = @"", *remainingText = @"", *playBtnTitle = @"";
+        [self readViaAXTitle:&title artist:&artist elapsed:&elapsedText
+                   remaining:&remainingText playTitle:&playBtnTitle];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            busy = NO;
+            if (title.length) { self->_axTitle = title; self->_axArtist = artist; }
+            if (playBtnTitle.length) self->_axPlay = playBtnTitle;
+            [self applyState:title artist:artist elapsed:elapsedText
+                   remaining:remainingText play:playBtnTitle];
+        });
+    });
+}
+
+// 低频刷新曲名/演奏状态：同样在后台队列，不阻塞主线程。
+- (void)refreshMetaViaAXAsync {
+    static BOOL busy = NO;
+    if (busy) return;
+    busy = YES;
+    dispatch_async(_axQueue, ^{
+        NSString *t = @"", *a = @"", *e = @"", *r = @"", *p = @"";
+        [self readViaAXTitle:&t artist:&a elapsed:&e remaining:&r playTitle:&p];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            busy = NO;
+            if (t.length) { self->_axTitle = t; self->_axArtist = a; }
+            if (p.length) self->_axPlay = p;
+        });
+    });
+}
+
+- (void)readViaAXTitle:(NSString *__autoreleasing *)title
+                artist:(NSString *__autoreleasing *)artist
+               elapsed:(NSString *__autoreleasing *)elapsed
+             remaining:(NSString *__autoreleasing *)remaining
+             playTitle:(NSString *__autoreleasing *)playTitle {
+    if (!_appElement) return;
     CFTypeRef windowsRef = NULL;
     if (AXUIElementCopyAttributeValue(_appElement, kAXWindowsAttribute, &windowsRef) != kAXErrorSuccess) return;
     CFArrayRef windows = (CFArrayRef)windowsRef;
     NSString *fallbackElapsed = @"", *fallbackRemaining = @"", *fallbackPlay = @"";
-    double fallbackFraction = 0;
     BOOL gotTitle = NO;
     for (CFIndex i = 0; i < CFArrayGetCount(windows); i++) {
         AXUIElementRef win = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
@@ -1056,8 +1667,8 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
          remaining:&rem playTitle:&pb fraction:&fr];
         // ① 优先采用「有曲名」的窗口，避免两个唱盘的 Elapsed time 互相覆盖导致来回跳
         if (t.length && !gotTitle) {
-            title = t; artist = a2; elapsedText = el;
-            remainingText = rem; playBtnTitle = pb; fraction = fr;
+            *title = t; *artist = a2; *elapsed = el;
+            *remaining = rem; *playTitle = pb;
             gotTitle = YES;
         } else if (!gotTitle && !fallbackElapsed.length && el.length) {
             // ② 但万一 AX 暂时读不到曲名（换歌瞬间、标题元素未就绪），
@@ -1065,19 +1676,208 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
             fallbackElapsed = el;
             fallbackRemaining = rem;
             fallbackPlay = pb;
-            fallbackFraction = fr;
         }
     }
     if (!gotTitle && fallbackElapsed.length) {
-        elapsedText = fallbackElapsed;
-        remainingText = fallbackRemaining;
-        playBtnTitle = fallbackPlay;
-        fraction = fallbackFraction;
+        *elapsed = fallbackElapsed;
+        *remaining = fallbackRemaining;
+        *playTitle = fallbackPlay;
     }
     CFRelease(windowsRef);
+}
 
-    // 按钮要先于 title 检查：没歌时也要能呼出歌词窗
-    [self ensureHostButton];
+// ---------------------------------------------------------------- 视图直读
+
+// 取一个视图的无障碍标签。NSTextField 在 AX 层暴露的 kAXDescriptionAttribute
+// 就是这里的 accessibilityDescription，同进程直接读，不用绕 XPC。
+- (NSString *)viewAXLabel:(NSView *)v {
+    @try {
+        // accessibilityDescription / accessibilityLabel / accessibilityIdentifier
+        // 属于 NSAccessibility 协议，NSView 头文件里没有直接声明，走 KVC 拿。
+        NSArray *keys = @[@"accessibilityDescription", @"accessibilityLabel", @"accessibilityIdentifier"];
+        for (NSString *k in keys) {
+            id d = [v valueForKey:k];
+            if ([d isKindOfClass:[NSString class]] && [d length]) return d;
+        }
+        return nil;
+    } @catch (NSException *e) {
+        return nil;
+    }
+}
+
+- (void)scanView:(NSView *)v depth:(int)depth
+           title:(NSString *__autoreleasing *)title
+          artist:(NSString *__autoreleasing *)artist
+         elapsed:(NSString *__autoreleasing *)elapsed
+       remaining:(NSString *__autoreleasing *)remaining
+       playTitle:(NSString *__autoreleasing *)playTitle {
+    if (!v || depth > 16) return;
+    if (v.hidden) return;
+
+    if ([v isKindOfClass:[NSTextField class]]) {
+        NSTextField *tf = (NSTextField *)v;
+        NSString *val = tf.stringValue;
+        if (val.length) {
+            NSString *label = [self viewAXLabel:tf];
+            if (label.length) {
+                if ([label isEqualToString:@"Title"]) *title = val;
+                else if ([label isEqualToString:@"Artist"]) *artist = val;
+                else if ([label isEqualToString:@"Elapsed time"]) *elapsed = val;
+                else if ([label isEqualToString:@"Remaining time"]) *remaining = val;
+            }
+        }
+    } else if ([v isKindOfClass:[NSButton class]]) {
+        NSString *t = ((NSButton *)v).title;
+        if (t.length && t.length > (*playTitle).length &&
+            ([t containsString:@"Pause"] || [t containsString:@"Play"] ||
+             [t containsString:@"暂停"] || [t containsString:@"播放"])) {
+            *playTitle = t;
+        }
+    }
+
+    for (NSView *sub in v.subviews) {
+        [self scanView:sub depth:depth + 1 title:title artist:artist
+               elapsed:elapsed remaining:remaining playTitle:playTitle];
+    }
+}
+
+// ---------------------------------------------------------------- 视图树诊断
+// 只在 NMP_DUMP_VIEWS=1 时跑一次，用来确认文字落在哪种控件、无障碍标签是什么。
+static NSInteger g_dumpLines = 0;
+
+- (void)dumpView:(NSView *)v depth:(int)d {
+    if (!v || g_dumpLines > 900) return;
+    g_dumpLines++;
+    NSString *pad = [@"" stringByPaddingToLength:(NSUInteger)(d * 2) withString:@" " startingAtIndex:0];
+    NSMutableString *extra = [NSMutableString string];
+    @try {
+        if ([v isKindOfClass:[NSTextField class]]) {
+            NSTextField *tf = (NSTextField *)v;
+            if (tf.stringValue.length) {
+                [extra appendFormat:@" text=\"%@\"", tf.stringValue];
+            }
+        } else if ([v isKindOfClass:[NSButton class]]) {
+            NSString *t = ((NSButton *)v).title;
+            if (t.length) [extra appendFormat:@" title=\"%@\"", t];
+        }
+        id desc = [v valueForKey:@"accessibilityDescription"];
+        if ([desc isKindOfClass:[NSString class]] && [desc length]) {
+            [extra appendFormat:@" desc=\"%@\"", desc];
+        }
+        id ident = [v valueForKey:@"accessibilityIdentifier"];
+        if ([ident isKindOfClass:[NSString class]] && [ident length]) {
+            [extra appendFormat:@" id=\"%@\"", ident];
+        }
+    } @catch (NSException *e) { }
+
+    NMPLog(@"%@%@%@", pad, NSStringFromClass([v class]), extra);
+    for (NSView *s in v.subviews) [self dumpView:s depth:d + 1];
+}
+
+- (void)dumpViews {
+    g_dumpLines = 0;
+    NMPLog(@"---- 视图树 dump 开始 ----");
+    for (NSWindow *w in [NSApp windows]) {
+        if (!w.isVisible) continue;
+        NMPLog(@"[窗口] \"%@\" %@", w.title, NSStringFromClass([w class]));
+        [self dumpView:w.contentView depth:1];
+    }
+    NMPLog(@"---- dump 结束（%ld 行）----", (long)g_dumpLines);
+}
+
+/// 返回 YES 表示「至少读到了一项可信内容」，可以走主路径；/// NO 表示视图里没有我们要的东西，交给 AX 兜底。
+- (BOOL)readFromViewsTitle:(NSString *__autoreleasing *)title
+                    artist:(NSString *__autoreleasing *)artist
+                   elapsed:(NSString *__autoreleasing *)elapsed
+                 remaining:(NSString *__autoreleasing *)remaining
+                 playTitle:(NSString *__autoreleasing *)playTitle {
+    if (![NSThread isMainThread]) return NO;
+    for (NSWindow *w in [NSApp windows]) {
+        if (!w.isVisible || w == _lyricsWindow) continue;
+        NSView *root = w.contentView;
+        if (!root) continue;
+        [self scanView:root depth:0 title:title artist:artist
+               elapsed:elapsed remaining:remaining playTitle:playTitle];
+        if ((*title).length) break;   // 认准有曲名的那个窗口（和 AX 路径同一策略）
+    }
+    return ((*title).length > 0 || (*elapsed).length > 0);
+}
+
+// ---------------------------------------------------------------- 进度直读（不靠无障碍标签）
+
+// 是否是 mm:ss / hh:mm:ss 这种时钟文本
+static BOOL NMPIsClock(NSString *s) {
+    if (s.length < 4 || s.length > 8) return NO;
+    NSInteger colons = 0, digits = 0;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c == ':') colons++;
+        else if (c >= '0' && c <= '9') digits++;
+        else return NO;
+    }
+    return colons >= 1 && digits >= 3;
+}
+
+- (void)collectTextFields:(NSView *)v into:(NSMutableArray<NSTextField *> *)out depth:(int)d {
+    if (!v || d > 16 || out.count > 600) return;
+    if ([v isKindOfClass:[NSTextField class]]) [out addObject:(NSTextField *)v];
+    for (NSView *s in v.subviews) [self collectTextFields:s into:out depth:d + 1];
+}
+
+/// 用「时间文本 + 同父容器成对出现」认出进度：
+/// 剩余时间是全界面唯一带负号的时钟（-00:00），它的兄弟节点就是已播时间。
+/// 这样不依赖任何无障碍标签 —— 实测 NMP 的标签只在 AX 层运行时生成，
+/// AppKit 的 accessibilityDescription 是空的，按标签匹配必然全部落空。
+- (BOOL)readTimesFromViewsElapsed:(NSString *__autoreleasing *)elapsed
+                        remaining:(NSString *__autoreleasing *)remaining {
+    if (![NSThread isMainThread]) return NO;
+    for (NSWindow *w in [NSApp windows]) {
+        if (!w.isVisible || w == _lyricsWindow) continue;
+        NSMutableArray<NSTextField *> *fields = [NSMutableArray array];
+        [self collectTextFields:w.contentView into:fields depth:0];
+        NSTextField *remField = nil;
+        for (NSTextField *tf in fields) {
+            NSString *s = tf.stringValue;
+            if (s.length > 1 && [s hasPrefix:@"-"] && NMPIsClock([s substringFromIndex:1])) {
+                remField = tf;
+                break;
+            }
+        }
+        if (!remField) continue;
+        *remaining = remField.stringValue;
+        // 已播时间排在剩余时间前面，但不一定同一个父容器（可能各裹一层）。
+        // 所以在扁平顺序里向前回溯找最近的那个时钟文本。
+        NSInteger idx = (NSInteger)[fields indexOfObject:remField];
+        for (NSInteger j = idx - 1; j >= 0 && j >= idx - 8; j--) {
+            NSString *s = fields[(NSUInteger)j].stringValue;
+            if (NMPIsClock(s)) { *elapsed = s; break; }
+        }
+        static BOOL loggedOnce = NO;
+        if (!loggedOnce && getenv("NMP_DUMP_VIEWS")) {
+            loggedOnce = YES;
+            NMPLog(@"进度直读命中：elapsed=\"%@\" remaining=\"%@\"",
+                   (*elapsed).length ? *elapsed : @"(空)",
+                   (*remaining).length ? *remaining : @"(空)");
+        }
+        return YES;
+    }
+    return NO;
+}
+
+// ---------------------------------------------------------------- 状态应用
+
+- (void)applyState:(NSString *)title
+            artist:(NSString *)artist
+           elapsed:(NSString *)elapsedText
+         remaining:(NSString *)remainingText
+              play:(NSString *)playBtnTitle {
+
+    // 视图路径只拿得到进度，曲名靠后台 AX 低频捎回。曲名没到之前先沿用上一次的
+    // —— 否则每一轮都会被判成「换歌」，歌词被反复清空又重新加载，看起来就是一直闪。
+    if (title.length == 0) {
+        title = _trackTitle ?: @"";
+        if (artist.length == 0) artist = _trackArtist ?: @"";
+    }
 
     if (title.length == 0 && elapsedText.length == 0) return;
 
@@ -1149,9 +1949,71 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
         _playing = NO;
         [self resolveLyricsForTitle:title artist:artist];
     }
+}
 
-    // 主窗健康复位放在 10Hz 的 poll 里做就够了，别占 60fps 的渲染循环
-    [self normalizeHostWindow:[self hostWindow]];
+// ---------------------------------------------------------------- 歌词点击跳转播放 (Click to Seek)
+
+- (NSSlider *)findScrubberInView:(NSView *)v {
+    if (!v) return nil;
+    if ([v isKindOfClass:NSClassFromString(@"NMPlayerScrubberSlider")]) {
+        return (NSSlider *)v;
+    }
+    for (NSView *sub in v.subviews) {
+        NSSlider *hit = [self findScrubberInView:sub];
+        if (hit) return hit;
+    }
+    return nil;
+}
+
+- (NSSlider *)findFallbackScrubberInView:(NSView *)v {
+    if (!v) return nil;
+    NSSlider *best = nil;
+    if ([v isKindOfClass:[NSSlider class]] && ![[v window] isEqual:_lyricsWindow]) {
+        NSSlider *sl = (NSSlider *)v;
+        if (sl.frame.size.width > 120) best = sl;
+    }
+    for (NSView *sub in v.subviews) {
+        NSSlider *cand = [self findFallbackScrubberInView:sub];
+        if (cand && (!best || cand.frame.size.width > best.frame.size.width)) {
+            best = cand;
+        }
+    }
+    return best;
+}
+
+- (void)seekToSeconds:(double)seconds {
+    if (seconds < 0) seconds = 0;
+    if (_totalDuration > 0 && seconds > _totalDuration) seconds = _totalDuration;
+
+    NSWindow *mainWin = [self hostWindow];
+    if (mainWin) {
+        NSSlider *scrubber = [self findScrubberInView:mainWin.contentView];
+        if (!scrubber) scrubber = [self findFallbackScrubberInView:mainWin.contentView];
+
+        if (scrubber) {
+            double maxV = scrubber.maxValue;
+            double minV = scrubber.minValue;
+            double targetVal = 0;
+            if (maxV <= 1.05 && _totalDuration > 0) {
+                targetVal = seconds / _totalDuration;
+            } else {
+                targetVal = seconds;
+            }
+            targetVal = MIN(maxV, MAX(minV, targetVal));
+            [scrubber setDoubleValue:targetVal];
+            if (scrubber.action) {
+                [NSApp sendAction:scrubber.action to:scrubber.target from:scrubber];
+            }
+        }
+    }
+
+    // 立即更新本地锚点，使歌词舞台无缝平滑瞬移，不再因等待 AX 轮询而产生视觉倒退
+    _lockedSeconds = seconds;
+    _lockedDate = [NSDate date];
+    _lastLockedE = seconds;
+    _haveAnchor = YES;
+    _stage.forceSettle = YES;
+    [self render];
 }
 
 // ---------------------------------------------------------------- NMP 标题栏里的「歌词」按钮
@@ -1166,8 +2028,9 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
     if (!theme) return nil;
     __block NSStackView *best = nil;
     __block CGFloat bestX = -CGFLOAT_MAX;
-    void (^__block walk)(NSView *);
-    walk = ^(NSView *v) {
+    __block __weak void (^weakWalk)(NSView *);
+    void (^walk)(NSView *);
+    weakWalk = walk = ^(NSView *v) {
         if ([v isKindOfClass:[NSStackView class]]) {
             NSStackView *sv = (NSStackView *)v;
             NSInteger hits = 0;
@@ -1182,7 +2045,7 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
                 if (inWin.origin.x > bestX) { bestX = inWin.origin.x; best = sv; }
             }
         }
-        for (NSView *sub in v.subviews) walk(sub);
+        for (NSView *sub in v.subviews) weakWalk(sub);
     };
     walk(theme);
     return best;
@@ -1192,11 +2055,12 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
     NSView *theme = w.contentView.superview;
     if (!theme) return nil;
     __block NSView *found = nil;
-    void (^__block walk)(NSView *);
-    walk = ^(NSView *v) {
+    __block __weak void (^weakWalk)(NSView *);
+    void (^walk)(NSView *);
+    weakWalk = walk = ^(NSView *v) {
         if (found) return;
         if ([NSStringFromClass(v.class) containsString:@"TitlebarContainer"]) { found = v; return; }
-        for (NSView *sub in v.subviews) walk(sub);
+        for (NSView *sub in v.subviews) weakWalk(sub);
     };
     walk(theme);
     return found;
@@ -1213,40 +2077,71 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
 
     NSStackView *stack = [self titlebarButtonStack:w];
     NSView *container = [self titlebarContainerOf:w];
-    if (!stack || !container) return;
+    if (!stack || !container) {
+        // poll 每 0.1s 会再试，所以只记一次，免得刷日志
+        static BOOL logged = NO;
+        if (!logged) {
+            logged = YES;
+            NMPLog(@"titlebar not ready: stack=%@ container=%@",
+                  stack ? @"ok" : @"nil", container ? @"ok" : @"nil");
+        }
+        return;
+    }
 
     // 图标尺寸/颜色按邻居实测：字形 16×16pt、纯白（截图量得 32×32 px @2x）
     NSImageSymbolConfiguration *cfg =
         [NSImageSymbolConfiguration configurationWithPointSize:15
                                                         weight:NSFontWeightMedium];
-    NSImage *icon = [[NSImage imageWithSystemSymbolName:@"captions.bubble"
-                                accessibilityDescription:@"歌词"]
-                     imageWithSymbolConfiguration:cfg];
-    icon.template = YES;
+    // ⚠️ captions.bubble 是较新系统才有的 SF Symbol。在 macOS 11/12 上取不到，
+    //    按钮会变成「有位置、没图标」的空白钮 —— 用户看起来就是「没有歌词入口」。
+    //    按新旧顺序回退，全都取不到就退成文字「词」。
+    NSImage *icon = nil;
+    for (NSString *sym in @[@"captions.bubble", @"text.bubble",
+                            @"bubble.left", @"captions.bubble.fill"]) {
+        icon = [[NSImage imageWithSystemSymbolName:sym accessibilityDescription:@"歌词"]
+                imageWithSymbolConfiguration:cfg];
+        if (icon) break;
+    }
+    if (icon) {
+        icon.template = YES;
+    } else {
+        NMPLog(@"no SF Symbol available, falling back to text button");
+    }
     NMPTitleButton *btn = [NMPTitleButton buttonWithImage:icon
                                                    target:self
                                                    action:@selector(toggleWindow:)];
     btn.bordered = NO;
-    btn.imagePosition = NSImageOnly;
+    btn.imagePosition = icon ? NSImageOnly : NSNoImage;
     btn.imageScaling = NSImageScaleProportionallyDown;
+    if (!icon) {
+        btn.title = @"词";
+        btn.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
+    }
     btn.contentTintColor = [NSColor whiteColor];
     btn.toolTip = @"歌词";
     btn.wantsLayer = YES;
-    btn.layer.cornerRadius = 6;
+    btn.layer.cornerRadius = 7;
     // 邻居底色实测 RGB(51,52,53)；我们原来是 0.22 白（渲染成 72,72,72），偏亮
     btn.layer.backgroundColor =
         [NSColor colorWithSRGBRed:51/255.0 green:52/255.0 blue:53/255.0 alpha:1.0].CGColor;
-    btn.autoresizingMask = 0;
+    // 跟着父视图右移：窗口改宽度时按钮和邻居一起走，不会等下一轮 poll 才跳过去
+    btn.autoresizingMask = NSViewMinXMargin;
 
     // 挂在 NSTitlebarContainerView（普通 NSView）而不是 NSStackView 里：
     // stack 只把事件转给它自己托管的 arrangedSubviews，塞普通子视图能看见但点不动。
     // 放到最上层，否则会被标题栏背景/工具栏盖住（看得见点不着）
     [container addSubview:btn positioned:NSWindowAbove relativeTo:nil];
     _lyricsButton = btn;
+    NMPLog(@"titlebar button installed");
     [self syncLyricsButtonFrame];
 }
 
 // 几何照抄邻居：同一 y、同高、同宽，挂在最左那个按钮的左边 10pt
+- (void)hostWindowGeometryChanged:(NSNotification *)note {
+    if (note.object == [self hostWindow]) [self syncLyricsButtonFrame];
+    if (note.object == _lyricsWindow) [self layoutStage];
+}
+
 - (void)syncLyricsButtonFrame {
     NSButton *btn = _lyricsButton;
     if (!btn || !btn.superview) return;
@@ -1266,10 +2161,14 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
 
     NSRect inWin = [first convertRect:first.bounds toView:nil];
     NSRect inContainer = [btn.superview convertRect:inWin fromView:nil];
+    // 系统标题栏按钮的 frame 比它看得见的底色要大一圈（上下各约 1pt），
+    // 我们的底色是用 layer 铺满 frame 的，照抄 frame 就会「比别人高一头」。
+    // 这里把高度内缩 2pt 并垂直居中，视觉高度才和邻居齐平。
+    CGFloat insetY = 1.0;
     NSRect target = NSMakeRect(inContainer.origin.x - 10 - inContainer.size.width,
-                               inContainer.origin.y,
+                               inContainer.origin.y + insetY,
                                inContainer.size.width,
-                               inContainer.size.height);
+                               MAX(16, inContainer.size.height - insetY * 2));
     if (!NSEqualRects(btn.frame, target)) btn.frame = target;
 }
 
@@ -1340,6 +2239,8 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
     NSInteger idx = 0, word = -1;
     double prog = 0;
     BOOL before = YES;
+    BOOL dots = NO;
+    CGFloat dotFade = 0;
 
     if (_lines.count) {
         double t = pos - _offset;
@@ -1352,15 +2253,37 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
                 NSInteger k = [self activeWordIn:line.words at:t];
                 word = k;
                 double wStart = (k >= 0) ? line.words[k].time : line.time;
-                double wEnd = (k + 1 < (NSInteger)line.words.count) ? line.words[k + 1].time
-                              : ((i + 1 < (NSInteger)_lines.count) ? _lines[i + 1].time : wStart + 1.2);
+                double wEnd = (k + 1 < (NSInteger)line.words.count)
+                              ? line.words[k + 1].time
+                              : (line.time + MAX(line.duration, 0.2));   // 末词收在本行演唱结束时
                 // 一句的最后一个词往往离下一句有间奏，按「到下一句」算会让这个字
                 // 拖很久才亮完（看着像不亮）。词内进度最多拉 1.2 秒。
                 if (wEnd - wStart > 1.2) wEnd = wStart + 1.2;
                 prog = (wEnd > wStart) ? (t - wStart) / (wEnd - wStart) : 1.0;
             } else {
-                double lEnd = (i + 1 < (NSInteger)_lines.count) ? _lines[i + 1].time : line.time + 4.0;
-                prog = (lEnd > line.time) ? (t - line.time) / (lEnd - line.time) : 0;
+                // 兜底（正常解析后每行都有词级时间轴了）：
+                // 用「实际演唱时长」而不是「到下一行的间隔」—— 否则间奏会被算进扫光。
+                double dur = (line.duration > 0.05) ? line.duration : 4.0;
+                prog = (t - line.time) / dur;
+            }
+
+            // ── 间奏判定：整行一次性判定，不再看「离下一行还剩多少秒」──
+            // 旧条件 nextT - t > 0.9 太松：句尾正常换气（一两秒）就被判成间奏，
+            // 于是到处都在闪点。现在改成看「这句唱完后到下句之间有多少纯静默」，
+            // 静默超过 3 秒（慢歌按语速放宽）才认定是间奏。
+            // 另外末句不判：歌词结束后还有大段尾奏，旧逻辑会一直亮着点。
+            double lineEnd = line.time + MAX(line.duration, 0.3);
+            NSInteger nx = i + 1;
+            if (nx < (NSInteger)_lines.count && t >= lineEnd + 0.3) {
+                double silence = _lines[nx].time - lineEnd;
+                // 有真实逐字时间戳的行，收尾时刻是量出来的，门槛可以低一点；
+                // 纯行级 LRC 只能靠字数估，误差大，门槛抬高到 3.6 秒起。
+                double gate = line.timed ? MAX(3.0, 8.0 * _cadence)
+                                         : MAX(3.6, 9.0 * _cadence);
+                if (silence >= gate) {
+                    dots = YES;
+                    dotFade = MIN(1.0, (t - lineEnd - 0.3) / 0.30);
+                }
             }
         }
     }
@@ -1369,11 +2292,17 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
     // 原来每帧无条件 setNeedsDisplay，等于每秒 20 次全量重画。
     BOOL changed = (_stage.activeIndex != idx || _stage.activeWord != word ||
                     _stage.beforeStart != before ||
-                    fabs(_stage.activeProgress - prog) > 0.002);
+                    _stage.showDots != dots ||
+                    fabs(_stage.dotFade - dotFade) > 0.01 ||
+                    fabs(_stage.activeProgress - prog) > 0.002 ||
+                    (dots && fabs(_stage.dotPhase - pos) > 0.03));   // 点的呼吸约 30fps
     _stage.activeIndex = idx;
     _stage.activeWord = word;
     _stage.activeProgress = prog;
     _stage.beforeStart = before;
+    _stage.showDots = dots;
+    _stage.dotFade = dots ? dotFade : 0;
+    _stage.dotPhase = dots ? pos : 0;
 
     if (changed || _stage.animating) [_stage setNeedsDisplay:YES];
 }
@@ -1845,6 +2774,140 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
     return hit;
 }
 
+static NSInteger NMPVisibleChars(NSString *s) {
+    NSInteger n = 0;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c == ' ' || c == '\t' || c == 0x3000 || c == 0x00a0) continue;
+        n++;
+    }
+    return n;
+}
+
+/// 补全时间轴：算出「每行真正唱多久」，并给没有词级时间戳的行合成词级时间轴。
+///
+/// 为什么要这一步：普通 LRC 只有行时间。旧代码把「下一行 - 本行」整段
+/// 当成本行的扫光时长 —— 中间只要隔着间奏，这一行就被摊成十几秒慢慢扫，
+/// 而实际上词早就唱完进间奏了。用户看到的就是「间奏前的歌词放慢动作」。
+///
+/// 判定方式：先估「唱这行需要多久」（字数 x 每字秒数），再和行间隔比。
+/// 间隔明显更长 => 多出来的部分是间奏，扫光只扫到唱完为止。
+- (void)synthesizeTimings:(NSMutableArray<NMPLine *> *)lines {
+    if (!lines.count) return;
+
+    // (1) 每字秒数：优先用真实词级时间戳反推（那是歌手实际唱出来的密度）
+    NSMutableArray<NSNumber *> *samples = [NSMutableArray array];
+    for (NMPLine *l in lines) {
+        if (l.words.count < 2) continue;
+        double d = l.words.lastObject.time - l.words.firstObject.time;
+        NSInteger n = NMPVisibleChars(l.text);
+        if (d > 0.08 && n >= 2) [samples addObject:@(d / (double)n)];
+    }
+    double rate = 0;
+    if (samples.count) {
+        [samples sortUsingSelector:@selector(compare:)];
+        rate = samples[samples.count / 2].doubleValue;   // 中位数，间奏行污染不到它
+    }
+
+    // 整首都没有词级时间戳时，用「行间隔中位数 / 字数中位数」量出这本曲子的语速，
+    // 比写死 0.34 准得多（快歌慢歌差别很大）。中位数同样抗间奏污染。
+    if (rate <= 0) {
+        NSMutableArray<NSNumber *> *gaps = [NSMutableArray array];
+        NSMutableArray<NSNumber *> *chars = [NSMutableArray array];
+        for (NSInteger i = 0; i < (NSInteger)lines.count; i++) {
+            NMPLine *l = lines[i];
+            NSInteger n = NMPVisibleChars(l.text);
+            if (n < 1) continue;
+            [chars addObject:@((double)n)];
+            if (i + 1 < (NSInteger)lines.count) {
+                double g = lines[i + 1].time - l.time;
+                if (g > 0.2 && g < 60) [gaps addObject:@(g)];
+            }
+        }
+        if (gaps.count >= 3) {
+            [gaps sortUsingSelector:@selector(compare:)];
+            [chars sortUsingSelector:@selector(compare:)];
+            double mg = gaps[gaps.count / 2].doubleValue;
+            double mc = MAX(2.0, chars[chars.count / 2].doubleValue);
+            // 行间隔里天然含「句尾气口」，直接除会系统性高估语速。
+            // 经验上一行真正在唱的时间约占间隔的七成。
+            rate = mg * 0.72 / mc;
+        }
+    }
+    if (rate <= 0) rate = 0.34;   // 中文流行歌经验值：一字约 0.3 秒
+    rate = MIN(MAX(rate, 0.15), 0.55);
+    _cadence = rate;              // 间奏门槛跟着语速走：慢歌的留白天然更长
+
+    for (NSInteger i = 0; i < (NSInteger)lines.count; i++) {
+        NMPLine *l = lines[i];
+        double gap = 4.0;
+        if (i + 1 < (NSInteger)lines.count) gap = lines[i + 1].time - l.time;
+        if (gap <= 0.01) gap = 4.0;
+
+        // (2) 这一行要唱多久
+        double dur;
+        if (l.words.count) {
+            // 有真实词级时间戳：末词起唱时刻 + 末词自己占的时长
+            // （l.time 已经含过 _lrcOffset，这里不能再加一次，否则偏移会被算两遍）
+            NMPWord *last = l.words.lastObject;
+            double end = last.time + NMPVisibleChars(last.text) * rate;
+            dur = end - l.time;
+        } else {
+            double natural = MAX(1, NMPVisibleChars(l.text)) * rate;
+            // 「允许的自然浮动」：字数估出来的时长再放宽 (x1.8 + 1.2 秒)，
+            // 短句拖长音、句尾留气口都不会被误判成间奏；
+            // 只有间隔远超这个余量，才认定中间是间奏，扫光只扫到唱完。
+            double allowance = natural * 1.8 + 1.2;
+            dur = (gap <= allowance) ? gap : natural * 1.15;
+        }
+        dur = MAX(dur, 0.45);
+        if (dur > gap) dur = gap;
+        l.duration = dur;
+
+        // (3) 没有词级时间戳的行，按「连续同类型字符」切块补一份
+        //    拉丁字母/数字整词一块（长单词占时更久），汉字一字一块，空格算轻量
+        if (l.words.count) continue;
+        NSString *t = l.text;
+        if (!t.length) continue;
+
+        NSMutableArray<NSString *> *pieces = [NSMutableArray array];
+        NSMutableArray<NSNumber *> *weights = [NSMutableArray array];
+        NSUInteger p = 0;
+        while (p < t.length) {
+            NSUInteger s0 = p;
+            unichar c = [t characterAtIndex:p];
+            BOOL isSpace = (c == ' ' || c == '\t' || c == 0x3000 || c == 0x00a0);
+            BOOL isLatin = (!isSpace && c < 128 &&
+                            [[NSCharacterSet alphanumericCharacterSet] characterIsMember:c]);
+            p++;
+            while (p < t.length) {
+                unichar c2 = [t characterAtIndex:p];
+                BOOL s2 = (c2 == ' ' || c2 == '\t' || c2 == 0x3000 || c2 == 0x00a0);
+                BOOL l2 = (!s2 && c2 < 128 &&
+                           [[NSCharacterSet alphanumericCharacterSet] characterIsMember:c2]);
+                if (s2 != isSpace || l2 != isLatin) break;
+                p++;
+            }
+            [pieces addObject:[t substringWithRange:NSMakeRange(s0, p - s0)]];
+            [weights addObject:@(isSpace ? 0.2 : (double)(p - s0))];
+        }
+
+        double totalW = 0;
+        for (NSNumber *x in weights) totalW += x.doubleValue;
+        if (totalW <= 0) continue;
+
+        NSMutableArray<NMPWord *> *made = [NSMutableArray array];
+        double acc = 0;
+        for (NSUInteger k = 0; k < pieces.count; k++) {
+            NMPWord *w = [NMPWord wordWithTime:l.time + l.duration * (acc / totalW)];
+            w.text = pieces[k];
+            acc += weights[k].doubleValue;
+            [made addObject:w];
+        }
+        l.words = made;
+    }
+}
+
 /// 统一歌词解析 —— 网易云 / QQ音乐 / 酷我 / 酷狗 的内嵌歌词通吃：
 ///
 ///   行级 LRC：        [00:32.444]戏一折 水袖起落
@@ -1948,6 +3011,7 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
             l.time = words.firstObject.time + _lrcOffset;
             l.text = trimmed;
             l.words = words;
+            l.timed = (words.count >= 2);   // 只有一个时间戳的行等于没有逐字信息
             [out addObject:l];
         } else if (lineTimes.count) {
             NSString *lineText = [headPlain stringByTrimmingCharactersInSet:
@@ -1967,6 +3031,7 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
         return (a.time == b.time) ? NSOrderedSame
              : ((a.time < b.time) ? NSOrderedAscending : NSOrderedDescending);
     }];
+    [self synthesizeTimings:out];   // 定每行演唱时长 + 补词级时间轴（治间奏慢动作）
     return out;
 }
 
@@ -1989,6 +3054,7 @@ static inline CGFloat NMPClassAlpha(NSInteger cls) {
         [NSApp activateIgnoringOtherApps:YES];
         [_lyricsWindow setAlphaValue:0];
         [_lyricsWindow makeKeyAndOrderFront:nil];
+        [self layoutStage];   // 窗口真出现后 safeAreaInsets 才有值，这时重算一次
         [NSAnimationContext runAnimationGroup:^(NSAnimationContext *c) {
             c.duration = 0.15;
             [[_lyricsWindow animator] setAlphaValue:1];
@@ -2032,12 +3098,31 @@ static void libNMPLyricsEntry(void) {
     g_rebindings = &r1;
     rebind_symbols();
 
+    NMPLog(@"dylib loaded (pid=%d)", getpid());
+
     dispatch_async(dispatch_get_main_queue(), ^{
+        NMPLog(@"registering launch observer");
         [[NSNotificationCenter defaultCenter]
             addObserverForName:NSApplicationDidFinishLaunchingNotification
                         object:nil queue:nil
                     usingBlock:^(NSNotification *n) {
+                        NMPLog(@"didFinishLaunching received");
                         [NMPLyricsController shared];
                     }];
+
+        // 兜底：这个 block 本身可能晚于「启动完成」通知才被执行
+        // （不同机器 / 不同磁盘速度下时序不一样），那样通知永远收不到，
+        // controller 不创建 → 标题栏没有按钮、⌘L 也没反应。
+        // shared 是 dispatch_once，重复调用是安全的。
+        for (double d = 0.5; d <= 3.05; d += 1.0) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if ([NSApp isRunning]) {
+                    NMPLog(@"fallback init at %.1fs (windows=%lu)",
+                          d, (unsigned long)[[NSApp windows] count]);
+                    [NMPLyricsController shared];
+                }
+            });
+        }
     });
 }

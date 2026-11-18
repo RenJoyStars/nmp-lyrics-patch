@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="/Applications/Neural Mix Pro.app"
 WORK="$ROOT/build/pkg"
 DIST="$ROOT/dist"
-NAME="Neural Mix Pro 歌词版 1.0.pkg"
+NAME="Neural Mix Pro 歌词版 1.2.pkg"
 
 [ -d "$APP" ] || { echo "找不到 $APP"; exit 1; }
 
@@ -21,7 +21,7 @@ echo "== 2/4 打组件包 =="
 pkgbuild --root "$WORK/root" \
          --scripts "$ROOT/Tools/pkg/scripts" \
          --identifier "cn.renqiaoyi.nmplyrics" \
-         --version "1.0" \
+         --version "1.2" \
          --install-location "/" \
          --ownership recommended \
          "$WORK/NeuralMixProLyrics.pkg"

@@ -25,7 +25,7 @@ xcrun clang \
     -dynamiclib \
     -fobjc-arc \
     -mmacosx-version-min=11.0 \
-    -framework AppKit -framework ApplicationServices -framework AVFoundation \
+    -framework AppKit -framework ApplicationServices -framework AVFoundation -framework QuartzCore \
     -Wno-deprecated-declarations \
     -install_name "@rpath/libNMPLyrics.dylib" \
     -o "$OUT/libNMPLyrics.dylib" \

@@ -16,5 +16,5 @@
     <choice id="cn.renqiaoyi.nmplyrics" visible="false">
         <pkg-ref id="cn.renqiaoyi.nmplyrics"/>
     </choice>
-    <pkg-ref id="cn.renqiaoyi.nmplyrics" version="1.0" onConclusion="none">NeuralMixProLyrics.pkg</pkg-ref>
+    <pkg-ref id="cn.renqiaoyi.nmplyrics" version="1.2" onConclusion="none">NeuralMixProLyrics.pkg</pkg-ref>
 </installer-gui-script>
