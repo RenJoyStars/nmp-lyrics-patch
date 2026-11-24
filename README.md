@@ -1,3 +1,5 @@
+<img src="docs/banner.png" alt="Neural Mix Pro 歌词补丁" width="100%">
+
 # Neural Mix Pro · 中文歌词补丁
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -13,6 +15,12 @@
 > `backup/`（原版备份，188MB）与 `dist/`（安装包，136MB）都在 `.gitignore` 里，不会出现在仓库中。
 >
 > 本项目与 Algoriddim 无关，未获其授权或认可；Neural Mix Pro 的著作权归 Algoriddim 所有。
+
+## 界面
+
+<img src="docs/screenshot-main.png" alt="汉化后的主界面" width="700">
+
+<sub>汉化后的主界面（**未加载音频**，所以中间是空的）。汉化的是应用内界面；顶部系统菜单仍是英文，那部分改不了。</sub>
 
 ## 快速开始
 
